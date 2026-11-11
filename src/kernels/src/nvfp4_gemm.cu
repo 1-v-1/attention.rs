@@ -130,6 +130,68 @@ __device__ __forceinline__ void dequant_store_8(int q4, float scale,
   dst[7] = (float)(int8_t)(w.y >> 24) * scale;
 }
 
+// ---------------------------------------------------------------------------
+// f16 high-byte LUT tables (P2: bit-identical fast extraction).
+//
+// The int8 tables above hold *2x the E2M1 value* as a signed byte, and the
+// kernel compensates that factor with `scale * 0.5f`.  The magnitudes
+// 2x E2M1 = {0,1,2,3,4,6,8,12} are all exactly representable in f16, so the
+// same numbers can be carried as f16 values instead of int8 bytes.  Every one
+// of them has a zero f16 low byte, so the f16 is just (high byte << 8) and a
+// single byte_perm lookup still yields one value per codeword.
+//
+// The tables below hold the f16 *high byte* of those magnitudes:
+//   codeword 0..7 -> 0x0000,0x3C00,0x4000,0x4200,0x4400,0x4600,0x4800,0x4A00
+//   negatives get the 0x8000 sign bit.
+// Because they encode the same magnitudes as the int8 tables, the extracted
+// floats are bit-identical to `(float)(int8_t)(...)` -- the only difference
+// is that the conversion goes through one f16->f32 convert per pair instead
+// of a shift plus a sign-extend plus an int8->f32 convert per element.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ int2 get_int_from_table_16_f16(const int q4,
+                                                          const uint32_t table0,
+                                                          const uint32_t table1,
+                                                          const uint32_t table2,
+                                                          const uint32_t table3) {
+  uint32_t tmp[2];
+  const uint32_t low_high_selection = 0x32103210 | ((q4 & 0x88888888) >> 1);
+#pragma unroll
+  for (uint32_t i = 0; i < 2; ++i) {
+    const uint32_t shift = 16 * i;
+    const uint32_t low = __byte_perm(table0, table1, q4 >> shift);
+    const uint32_t high = __byte_perm(table2, table3, q4 >> shift);
+    tmp[i] = __byte_perm(low, high, low_high_selection >> shift);
+  }
+  return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420),
+                   __byte_perm(tmp[0], tmp[1], 0x7531));
+}
+
+// Decode 8 codewords into 8 f16 values (as four half2) using the f16
+// high-byte tables.  `dst4[i]` holds the codewords 2i and 2i+1.
+__device__ __forceinline__ void dequant_store_8_f16(int q4,
+                                                     uint32_t LUT0,
+                                                     uint32_t LUT1,
+                                                     uint32_t LUT2,
+                                                     uint32_t LUT3,
+                                                     __half2 *dst4) {
+  const int2 w = get_int_from_table_16_f16(q4, LUT0, LUT1, LUT2, LUT3);
+  // w.x holds codewords 0,2,4,6 in bytes 0..3; w.y holds 1,3,5,7.  The
+  // element-wise chain consumes them interleaved (w.x.b0, w.y.b0, w.x.b1,
+  // w.y.b1, ...), i.e. codewords 0..7 in order.
+  const uint32_t bytes[8] = {
+      (uint32_t)(w.x & 0xffu),         (uint32_t)(w.y & 0xffu),
+      (uint32_t)((w.x >> 8) & 0xffu),   (uint32_t)((w.y >> 8) & 0xffu),
+      (uint32_t)((w.x >> 16) & 0xffu),  (uint32_t)((w.y >> 16) & 0xffu),
+      (uint32_t)((w.x >> 24) & 0xffu),  (uint32_t)((w.y >> 24) & 0xffu),
+  };
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const __half lo = __ushort_as_half((unsigned short)(bytes[2 * i] << 8));
+    const __half hi = __ushort_as_half((unsigned short)(bytes[2 * i + 1] << 8));
+    dst4[i] = __halves2half2(lo, hi);
+  }
+}
+
 // Alignment-safe uint2 load from byte-packed weight arrays.
 // V100 (SM70) can fault on misaligned uint2 loads from uint8_t* pointers;
 // SM80+ handles this fine. memcpy is optimized to a single LDG by NVCC.
@@ -229,6 +291,12 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
   const uint32_t LUT1 = 0x0C080604;
   const uint32_t LUT2 = 0xFDFEFF00;
   const uint32_t LUT3 = 0xF4F8FAFC;
+  // f16 high-byte tables holding the same magnitudes as the int8 tables
+  // (2x E2M1), used for the bit-identical fast extraction path.
+  const uint32_t FLUT0 = 0x42403C00;
+  const uint32_t FLUT1 = 0x4A484644;
+  const uint32_t FLUT2 = 0xC2C0BC00;
+  const uint32_t FLUT3 = 0xCAC8C6C4;
 
   const int tid = threadIdx.x;
   const int block_size = blockDim.x;
@@ -325,26 +393,25 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
       uint2 w_vec = load_uint2_safe(w_row + k / 2);
       const float *in = s_input + (k + (k / WARP_SIZE));
 
+      // The f16 tables carry the same magnitudes as the int8 tables, so the
+      // FMA inputs stay bit-identical while the per-element shift /
+      // sign-extend / int8->f32 sequence collapses into one f16->f32
+      // convert per pair.
       float partial = 0.0f;
-      int2 w0 = get_int_from_table_16(w_vec.x, LUT0, LUT1, LUT2, LUT3);
-      partial = fmaf(in[0], (float)(int8_t)(w0.x), partial);
-      partial = fmaf(in[1], (float)(int8_t)(w0.y), partial);
-      partial = fmaf(in[2], (float)(int8_t)(w0.x >> 8), partial);
-      partial = fmaf(in[3], (float)(int8_t)(w0.y >> 8), partial);
-      partial = fmaf(in[4], (float)(int8_t)(w0.x >> 16), partial);
-      partial = fmaf(in[5], (float)(int8_t)(w0.y >> 16), partial);
-      partial = fmaf(in[6], (float)(int8_t)(w0.x >> 24), partial);
-      partial = fmaf(in[7], (float)(int8_t)(w0.y >> 24), partial);
-
-      int2 w1 = get_int_from_table_16(w_vec.y, LUT0, LUT1, LUT2, LUT3);
-      partial = fmaf(in[8], (float)(int8_t)(w1.x), partial);
-      partial = fmaf(in[9], (float)(int8_t)(w1.y), partial);
-      partial = fmaf(in[10], (float)(int8_t)(w1.x >> 8), partial);
-      partial = fmaf(in[11], (float)(int8_t)(w1.y >> 8), partial);
-      partial = fmaf(in[12], (float)(int8_t)(w1.x >> 16), partial);
-      partial = fmaf(in[13], (float)(int8_t)(w1.y >> 16), partial);
-      partial = fmaf(in[14], (float)(int8_t)(w1.x >> 24), partial);
-      partial = fmaf(in[15], (float)(int8_t)(w1.y >> 24), partial);
+      {
+        __half2 h0[4], h1[4];
+        dequant_store_8_f16(w_vec.x, FLUT0, FLUT1, FLUT2, FLUT3, h0);
+        dequant_store_8_f16(w_vec.y, FLUT0, FLUT1, FLUT2, FLUT3, h1);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const float2 a = __half22float2(h0[i]);
+          const float2 b = __half22float2(h1[i]);
+          partial = fmaf(in[2 * i], a.x, partial);
+          partial = fmaf(in[2 * i + 1], a.y, partial);
+          partial = fmaf(in[8 + 2 * i], b.x, partial);
+          partial = fmaf(in[8 + 2 * i + 1], b.y, partial);
+        }
+      }
       acc = fmaf(partial, block_scale, acc);
 
       int k2 = k + NVFP4_BLOCK_SIZE;
@@ -357,25 +424,20 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
         const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
 
         float partial2 = 0.0f;
-        int2 w2a = get_int_from_table_16(w_vec2.x, LUT0, LUT1, LUT2, LUT3);
-        partial2 = fmaf(in2[0], (float)(int8_t)(w2a.x), partial2);
-        partial2 = fmaf(in2[1], (float)(int8_t)(w2a.y), partial2);
-        partial2 = fmaf(in2[2], (float)(int8_t)(w2a.x >> 8), partial2);
-        partial2 = fmaf(in2[3], (float)(int8_t)(w2a.y >> 8), partial2);
-        partial2 = fmaf(in2[4], (float)(int8_t)(w2a.x >> 16), partial2);
-        partial2 = fmaf(in2[5], (float)(int8_t)(w2a.y >> 16), partial2);
-        partial2 = fmaf(in2[6], (float)(int8_t)(w2a.x >> 24), partial2);
-        partial2 = fmaf(in2[7], (float)(int8_t)(w2a.y >> 24), partial2);
-
-        int2 w2b = get_int_from_table_16(w_vec2.y, LUT0, LUT1, LUT2, LUT3);
-        partial2 = fmaf(in2[8], (float)(int8_t)(w2b.x), partial2);
-        partial2 = fmaf(in2[9], (float)(int8_t)(w2b.y), partial2);
-        partial2 = fmaf(in2[10], (float)(int8_t)(w2b.x >> 8), partial2);
-        partial2 = fmaf(in2[11], (float)(int8_t)(w2b.y >> 8), partial2);
-        partial2 = fmaf(in2[12], (float)(int8_t)(w2b.x >> 16), partial2);
-        partial2 = fmaf(in2[13], (float)(int8_t)(w2b.y >> 16), partial2);
-        partial2 = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24), partial2);
-        partial2 = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24), partial2);
+        {
+          __half2 h2a[4], h2b[4];
+          dequant_store_8_f16(w_vec2.x, FLUT0, FLUT1, FLUT2, FLUT3, h2a);
+          dequant_store_8_f16(w_vec2.y, FLUT0, FLUT1, FLUT2, FLUT3, h2b);
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const float2 a = __half22float2(h2a[i]);
+            const float2 b = __half22float2(h2b[i]);
+            partial2 = fmaf(in2[2 * i], a.x, partial2);
+            partial2 = fmaf(in2[2 * i + 1], a.y, partial2);
+            partial2 = fmaf(in2[8 + 2 * i], b.x, partial2);
+            partial2 = fmaf(in2[8 + 2 * i + 1], b.y, partial2);
+          }
+        }
         acc = fmaf(partial2, block_scale2, acc);
       }
     }
@@ -554,6 +616,12 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
   const uint32_t LUT1 = 0x0C080604;
   const uint32_t LUT2 = 0xFDFEFF00;
   const uint32_t LUT3 = 0xF4F8FAFC;
+  // f16 high-byte tables holding the same magnitudes as the int8 tables
+  // (2x E2M1), used for the bit-identical fast extraction path.
+  const uint32_t FLUT0 = 0x42403C00;
+  const uint32_t FLUT1 = 0x4A484644;
+  const uint32_t FLUT2 = 0xC2C0BC00;
+  const uint32_t FLUT3 = 0xCAC8C6C4;
 
   const int tid = threadIdx.x;
   const int block_size = blockDim.x;
@@ -675,26 +743,25 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
         uint2 w_vec = load_uint2_safe(w_row + k / 2);
         const float *in = s_input_padded + (k + (k / WARP_SIZE));
 
+        // f16 tables carry the same magnitudes as the int8 tables, so the
+        // FMA inputs stay bit-identical while the per-element shift /
+        // sign-extend / int8->f32 sequence collapses into one f16->f32
+        // convert per pair.
         float partial = 0.0f;
-        int2 w0 = get_int_from_table_16(w_vec.x, LUT0, LUT1, LUT2, LUT3);
-        partial = fmaf(in[0], (float)(int8_t)(w0.x), partial);
-        partial = fmaf(in[1], (float)(int8_t)(w0.y), partial);
-        partial = fmaf(in[2], (float)(int8_t)(w0.x >> 8), partial);
-        partial = fmaf(in[3], (float)(int8_t)(w0.y >> 8), partial);
-        partial = fmaf(in[4], (float)(int8_t)(w0.x >> 16), partial);
-        partial = fmaf(in[5], (float)(int8_t)(w0.y >> 16), partial);
-        partial = fmaf(in[6], (float)(int8_t)(w0.x >> 24), partial);
-        partial = fmaf(in[7], (float)(int8_t)(w0.y >> 24), partial);
-
-        int2 w1 = get_int_from_table_16(w_vec.y, LUT0, LUT1, LUT2, LUT3);
-        partial = fmaf(in[8], (float)(int8_t)(w1.x), partial);
-        partial = fmaf(in[9], (float)(int8_t)(w1.y), partial);
-        partial = fmaf(in[10], (float)(int8_t)(w1.x >> 8), partial);
-        partial = fmaf(in[11], (float)(int8_t)(w1.y >> 8), partial);
-        partial = fmaf(in[12], (float)(int8_t)(w1.x >> 16), partial);
-        partial = fmaf(in[13], (float)(int8_t)(w1.y >> 16), partial);
-        partial = fmaf(in[14], (float)(int8_t)(w1.x >> 24), partial);
-        partial = fmaf(in[15], (float)(int8_t)(w1.y >> 24), partial);
+        {
+          __half2 h0[4], h1[4];
+          dequant_store_8_f16(w_vec.x, FLUT0, FLUT1, FLUT2, FLUT3, h0);
+          dequant_store_8_f16(w_vec.y, FLUT0, FLUT1, FLUT2, FLUT3, h1);
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const float2 a = __half22float2(h0[i]);
+            const float2 b = __half22float2(h1[i]);
+            partial = fmaf(in[2 * i], a.x, partial);
+            partial = fmaf(in[2 * i + 1], a.y, partial);
+            partial = fmaf(in[8 + 2 * i], b.x, partial);
+            partial = fmaf(in[8 + 2 * i + 1], b.y, partial);
+          }
+        }
         acc = fmaf(partial, block_scale, acc);
 
         int k2 = k + NVFP4_BLOCK_SIZE;
@@ -707,25 +774,20 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
           const float *in2 = s_input_padded + (k2 + (k2 / WARP_SIZE));
 
           float partial2 = 0.0f;
-          int2 w2a = get_int_from_table_16(w_vec2.x, LUT0, LUT1, LUT2, LUT3);
-          partial2 = fmaf(in2[0], (float)(int8_t)(w2a.x), partial2);
-          partial2 = fmaf(in2[1], (float)(int8_t)(w2a.y), partial2);
-          partial2 = fmaf(in2[2], (float)(int8_t)(w2a.x >> 8), partial2);
-          partial2 = fmaf(in2[3], (float)(int8_t)(w2a.y >> 8), partial2);
-          partial2 = fmaf(in2[4], (float)(int8_t)(w2a.x >> 16), partial2);
-          partial2 = fmaf(in2[5], (float)(int8_t)(w2a.y >> 16), partial2);
-          partial2 = fmaf(in2[6], (float)(int8_t)(w2a.x >> 24), partial2);
-          partial2 = fmaf(in2[7], (float)(int8_t)(w2a.y >> 24), partial2);
-
-          int2 w2b = get_int_from_table_16(w_vec2.y, LUT0, LUT1, LUT2, LUT3);
-          partial2 = fmaf(in2[8], (float)(int8_t)(w2b.x), partial2);
-          partial2 = fmaf(in2[9], (float)(int8_t)(w2b.y), partial2);
-          partial2 = fmaf(in2[10], (float)(int8_t)(w2b.x >> 8), partial2);
-          partial2 = fmaf(in2[11], (float)(int8_t)(w2b.y >> 8), partial2);
-          partial2 = fmaf(in2[12], (float)(int8_t)(w2b.x >> 16), partial2);
-          partial2 = fmaf(in2[13], (float)(int8_t)(w2b.y >> 16), partial2);
-          partial2 = fmaf(in2[14], (float)(int8_t)(w2b.x >> 24), partial2);
-          partial2 = fmaf(in2[15], (float)(int8_t)(w2b.y >> 24), partial2);
+          {
+            __half2 h2a[4], h2b[4];
+            dequant_store_8_f16(w_vec2.x, FLUT0, FLUT1, FLUT2, FLUT3, h2a);
+            dequant_store_8_f16(w_vec2.y, FLUT0, FLUT1, FLUT2, FLUT3, h2b);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+              const float2 a = __half22float2(h2a[i]);
+              const float2 b = __half22float2(h2b[i]);
+              partial2 = fmaf(in2[2 * i], a.x, partial2);
+              partial2 = fmaf(in2[2 * i + 1], a.y, partial2);
+              partial2 = fmaf(in2[8 + 2 * i], b.x, partial2);
+              partial2 = fmaf(in2[8 + 2 * i + 1], b.y, partial2);
+            }
+          }
           acc = fmaf(partial2, block_scale2, acc);
         }
       }
