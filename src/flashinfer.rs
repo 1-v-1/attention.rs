@@ -332,8 +332,8 @@ impl candle::CustomOp1 for FlashInferAppend {
 
         let (k_scale_ptr, v_scale_ptr) = if data_type == 2 {
             let sm = cuda_utils::sm_version(dev).unwrap_or(0);
-            if sm < 80 {
-                candle::bail!("flashinfer fp8 append requires sm80+, got sm{}", sm);
+            if sm < 70 {
+                candle::bail!("flashinfer fp8 append requires sm70+, got sm{}", sm);
             }
             let k_scales = self
                 .k_scale
@@ -492,8 +492,8 @@ impl FlashInferDecodeWithPlan {
 
         let sm = cuda_utils::sm_version(dev).unwrap_or(0);
         if data_type == 2 {
-            if sm < 80 {
-                candle::bail!("flashinfer fp8 decode requires sm80+, got sm{}", sm);
+            if sm < 70 {
+                candle::bail!("flashinfer fp8 decode requires sm70+, got sm{}", sm);
             }
         }
         let use_sm90_fp8 = false;
@@ -845,14 +845,16 @@ pub fn prefill_plan(
         get_plan_workspace(dev, enable_cuda_graph)?;
 
     let is_fp8 = kv_dtype.map_or(false, |d| d == DType::U8);
-    let use_fp8_fa2_plan = is_fp8 && sm >= 90;
+    // FP8 KV on any arch without the SM90A FP8 ops (SM70-Volta WMMA included)
+    // rides the FA2 BatchPrefill plan; the gate used to exclude SM70/75.
+    let use_fp8_fa2_plan = is_fp8 && sm >= 70;
     let use_sm90_plan = sm == 90 && !use_fp8_fa2_plan;
     let mut plan_info = vec![0i64; if use_sm90_plan { 10 } else { 16 }];
     unsafe {
         #[cfg(feature = "flashinfer")]
         if use_fp8_fa2_plan {
             if !crate::has_flashinfer_fp8_e4m3() {
-                candle::bail!("FP8 KvCache prefill requires SM90+ or env ENABLE_FLASHINFER_SOFTWARE_FP8=1 during build!");
+                candle::bail!("FP8 KvCache prefill requires SM70+ or env ENABLE_FLASHINFER_SOFTWARE_FP8=1 during build!");
             }
             // Must forward enable_cuda_graph into PrefillPlan. Hardcoding false
             // made MTP/DFlash verify CUDA graphs bake non-graph plan pointers
@@ -1432,8 +1434,8 @@ impl FlashInferRaggedPrefill {
         let mut v_scale_ptr = std::ptr::null();
         if data_type == 2 {
             let sm = cuda_utils::sm_version(dev).unwrap_or(0);
-            if sm < 80 {
-                candle::bail!("flashinfer fp8 ragged prefill requires sm80+, got sm{}", sm);
+            if sm < 70 {
+                candle::bail!("flashinfer fp8 ragged prefill requires sm70+, got sm{}", sm);
             }
             let k_scales = self
                 .k_scale

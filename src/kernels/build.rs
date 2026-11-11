@@ -221,7 +221,12 @@ fn main() -> Result<()> {
                 builder = builder.arg("-DSM_90_PASS");
             }
             let flashinfer_sw_fp8 = std::env::var("ENABLE_FLASHINFER_SOFTWARE_FP8").is_ok();
-            if compute_cap >= 90 || (compute_cap >= 80 && flashinfer_sw_fp8) {
+            // SM70/SM75 (Volta/Turing) have no hardware FP8, but the FA2 batch
+            // prefill/decode templates only raw-cast FP8->float inside the kernel,
+            // so the E4M3 KV-cache path works there once the feature is compiled
+            // in (Volta WMMA fragments cover the m16n16k16 logical layouts).
+            // Include them when the software-FP8 build switch is set.
+            if compute_cap >= 90 || (compute_cap >= 70 && flashinfer_sw_fp8) {
                 builder = builder.arg("-DFLASHINFER_ENABLE_FP8_E4M3");
             }
             if compute_cap >= 90 {
