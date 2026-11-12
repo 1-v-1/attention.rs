@@ -324,6 +324,9 @@ __device__ __forceinline__ float hw_dot_16(uint2 packed, float scale,
 // Number of output rows one decode block covers.  The block stages the
 // activation row once and then walks its rows, so a larger value amortises
 // the staging over more output columns.
+// Warps per decode block.  Each warp owns two output rows, so a block
+// covers 2 * ROWS rows.  A single-token decode needs the block count, a
+// wider batch prefers the instruction-level parallelism.
 #ifndef NVFP4_DECODE_BLOCK_ROWS
 #define NVFP4_DECODE_BLOCK_ROWS 8
 #endif
@@ -332,7 +335,7 @@ __device__ __forceinline__ float hw_dot_16(uint2 packed, float scale,
 #endif
 constexpr int BLOCK_N_SM = NVFP4_DECODE_BLOCK_ROWS;
 
-template <typename T, int ROWS>
+template <typename T, int ROWS, bool DUAL_ROW>
 __launch_bounds__(ROWS * WARP_SIZE) __global__
     void nvfp4_matmul_smallm_kernel(const T *__restrict__ input,
                                     const uint8_t *__restrict__ weight,
@@ -366,7 +369,10 @@ __launch_bounds__(ROWS * WARP_SIZE) __global__
   const int warp_id = tid / WARP_SIZE;
   const int lane_id = tid % WARP_SIZE;
   const int row = blockIdx.y;
-  const int n_base = blockIdx.x * ROWS;
+  // With DUAL_ROW a warp owns two output rows and a block covers 2 * ROWS
+  // rows; otherwise a block covers ROWS rows.
+  const int rows_per_block = DUAL_ROW ? 2 * ROWS : ROWS;
+  const int n_base = blockIdx.x * rows_per_block;
   const int n_idx = n_base + warp_id;
   const int weight_row_stride = K / 2;
   const int scale_stride = CEILDIV(K, NVFP4_BLOCK_SIZE);
@@ -449,7 +455,21 @@ __launch_bounds__(ROWS * WARP_SIZE) __global__
   const float gscale =
       weight_row_scales ? weight_row_scales[n_idx] : weight_global_scale;
 
+  // A second output row for the same warp.  Two rows give two independent
+  // load chains, so the DRAM latency of one row overlaps with the arithmetic
+  // of the other; with one row per warp there is nothing to overlap with.
+  const int n_idx2 = n_base + warp_id + ROWS;
+  const bool has_row2 = DUAL_ROW && (n_idx2 < N);
+  const uint8_t *w_row2 = weight + (size_t)n_idx2 * weight_row_stride;
+  const uint8_t *w_scale_row2 =
+      weight_scale + (size_t)n_idx2 * scale_stride;
+  const float gscale2 =
+      has_row2 ? (weight_row_scales ? weight_row_scales[n_idx2]
+                                    : weight_global_scale)
+               : 0.0f;
+
   float acc = 0.0f;
+  float acc2 = 0.0f;
 
   constexpr int ELEMS_PER_LANE = 2 * NVFP4_BLOCK_SIZE; // 32
   for (int k = lane_id * ELEMS_PER_LANE; k < K;
@@ -508,6 +528,30 @@ __launch_bounds__(ROWS * WARP_SIZE) __global__
       }
       acc = fmaf(partial, block_scale, acc);
 
+      // Second row: independent loads, so this overlaps with the first row.
+      if (has_row2) {
+        float block_scale_b =
+            dispatch_fp8_to_float(__ldg(&w_scale_row2[k / NVFP4_BLOCK_SIZE])) *
+            gscale2 * 0.5f;
+        uint2 w_vec_b = load_uint2_safe(w_row2 + k / 2);
+        float partial_b = 0.0f;
+        {
+          __half2 h0b[4], h1b[4];
+          dequant_store_8_f16(w_vec_b.x, FLUT0, FLUT1, FLUT2, FLUT3, h0b);
+          dequant_store_8_f16(w_vec_b.y, FLUT0, FLUT1, FLUT2, FLUT3, h1b);
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const float2 a = __half22float2(h0b[i]);
+            const float2 b = __half22float2(h1b[i]);
+            partial_b = fmaf(to_f32(in[2 * i]), a.x, partial_b);
+            partial_b = fmaf(to_f32(in[2 * i + 1]), a.y, partial_b);
+            partial_b = fmaf(to_f32(in[8 + 2 * i]), b.x, partial_b);
+            partial_b = fmaf(to_f32(in[8 + 2 * i + 1]), b.y, partial_b);
+          }
+        }
+        acc2 = fmaf(partial_b, block_scale_b, acc2);
+      }
+
       int k2 = k + NVFP4_BLOCK_SIZE;
       if (k2 < K) {
         float block_scale2 =
@@ -533,6 +577,29 @@ __launch_bounds__(ROWS * WARP_SIZE) __global__
           }
         }
         acc = fmaf(partial2, block_scale2, acc);
+
+        if (has_row2) {
+          float block_scale_b2 = dispatch_fp8_to_float(
+                                     __ldg(&w_scale_row2[k2 / NVFP4_BLOCK_SIZE])) *
+                                 gscale2 * 0.5f;
+          uint2 w_vec_b2 = load_uint2_safe(w_row2 + k2 / 2);
+          float partial_b2 = 0.0f;
+          {
+            __half2 h2ab[4], h2bb[4];
+            dequant_store_8_f16(w_vec_b2.x, FLUT0, FLUT1, FLUT2, FLUT3, h2ab);
+            dequant_store_8_f16(w_vec_b2.y, FLUT0, FLUT1, FLUT2, FLUT3, h2bb);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+              const float2 a = __half22float2(h2ab[i]);
+              const float2 b = __half22float2(h2bb[i]);
+              partial_b2 = fmaf(to_f32(in2[2 * i]), a.x, partial_b2);
+              partial_b2 = fmaf(to_f32(in2[2 * i + 1]), a.y, partial_b2);
+              partial_b2 = fmaf(to_f32(in2[8 + 2 * i]), b.x, partial_b2);
+              partial_b2 = fmaf(to_f32(in2[8 + 2 * i + 1]), b.y, partial_b2);
+            }
+          }
+          acc2 = fmaf(partial_b2, block_scale_b2, acc2);
+        }
       }
     }
   }
@@ -540,6 +607,9 @@ __launch_bounds__(ROWS * WARP_SIZE) __global__
 #pragma unroll
   for (int offset = 16; offset > 0; offset /= 2) {
     acc += __shfl_down_sync(0xffffffff, acc, offset);
+    if (has_row2) {
+      acc2 += __shfl_down_sync(0xffffffff, acc2, offset);
+    }
   }
 
   if (lane_id == 0) {
@@ -554,6 +624,22 @@ __launch_bounds__(ROWS * WARP_SIZE) __global__
       output[(size_t)row * N + n_idx] = __float2half(acc);
     } else {
       output[(size_t)row * N + n_idx] = __float2bfloat16_rn(acc);
+    }
+  }
+
+  if (has_row2 && lane_id == 0) {
+    float v = acc2;
+    if (has_bias && bias != nullptr) {
+      if constexpr (std::is_same_v<T, half>) {
+        v += __half2float(__ldg(&bias[n_idx2]));
+      } else {
+        v += __bfloat162float(__ldg(&bias[n_idx2]));
+      }
+    }
+    if constexpr (std::is_same_v<T, half>) {
+      output[(size_t)row * N + n_idx2] = __float2half(v);
+    } else {
+      output[(size_t)row * N + n_idx2] = __float2bfloat16_rn(v);
     }
   }
 }
@@ -1195,7 +1281,9 @@ static void launch_nvfp4_smallm(const T *input, const uint8_t *weight,
   constexpr int kBatch = NVFP4_DECODE_BLOCK_ROWS_BATCH;
   const size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(T);
   if (M == 1) {
-    auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<T, kSingle>;
+    // A single token has nothing to overlap with, so each warp keeps one
+    // row and the block count stays as high as possible.
+    auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<T, kSingle, false>;
     dim3 block(kSingle * WARP_SIZE);
     dim3 grid(CEILDIV(N, kSingle), M);
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1204,9 +1292,11 @@ static void launch_nvfp4_smallm(const T *input, const uint8_t *weight,
         input, weight, weight_scale, weight_global_scale, weight_row_scales,
         bias, output, M, N, K, has_bias, force_lut);
   } else {
-    auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<T, kBatch>;
+    // A wider batch can afford two rows per warp: the loads of one row
+    // overlap with the arithmetic of the other.
+    auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<T, kBatch, true>;
     dim3 block(kBatch * WARP_SIZE);
-    dim3 grid(CEILDIV(N, kBatch), M);
+    dim3 grid(CEILDIV(N, 2 * kBatch), M);
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)smem);
     kernel<<<grid, block, smem, stream>>>(
