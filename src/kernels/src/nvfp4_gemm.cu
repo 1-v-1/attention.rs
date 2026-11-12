@@ -321,7 +321,13 @@ __device__ __forceinline__ float hw_dot_16(uint2 packed, float scale,
 //
 // On SM100+ (Blackwell): uses hw_dot_16 with __nv_cvt_fp4x2_to_halfraw2
 // intrinsics for hardware FP4 dequantization — eliminates LUT tables entirely.
-constexpr int BLOCK_N_SM = 8;
+// Number of output rows one decode block covers.  The block stages the
+// activation row once and then walks its rows, so a larger value amortises
+// the staging over more output columns.
+#ifndef NVFP4_DECODE_BLOCK_ROWS
+#define NVFP4_DECODE_BLOCK_ROWS 8
+#endif
+constexpr int BLOCK_N_SM = NVFP4_DECODE_BLOCK_ROWS;
 
 template <typename T>
 __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
@@ -937,6 +943,20 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
 #endif
 #define WMMA_BK 16
 
+// Shared-memory layout of the wmma path.  The staging area and the output
+// area overlap: the output is produced after the k loop, so it can reuse the
+// staging space.  On Volta the shared-memory budget decides how many blocks
+// stay resident per SM, and the output buffer alone was three quarters of
+// the footprint.
+template <typename T, int BM, int BN>
+union WmmaSmem {
+  struct {
+    T a[BM][WMMA_BK + 8];
+    T b[BN][WMMA_BK + 8];
+  } work;
+  float out[BM][BN + 4];
+};
+
 template <typename T, int BM, int BN>
 __global__ void nvfp4_wmma_matmul_kernel(
     const T *__restrict__ input,
@@ -985,8 +1005,16 @@ __global__ void nvfp4_wmma_matmul_kernel(
     for (int j = 0; j < BN / 32; j++)
       fill_fragment(acc[i][j], 0.0f);
 
-  __shared__ T s_a[BM][WMMA_BK + 8];
-  __shared__ T s_b[BN][WMMA_BK + 8];
+  // The staging buffers and the output buffer share one allocation: the
+  // output is only written after the k loop has finished, so it can reuse
+  // the staging space.  On Volta the shared-memory budget decides how many
+  // blocks stay resident per SM, and the output buffer alone was three
+  // quarters of the footprint.
+  extern __shared__ char wmma_smem_raw[];
+  WmmaSmem<T, BM, BN> &wmma_smem =
+      *reinterpret_cast<WmmaSmem<T, BM, BN> *>(wmma_smem_raw);
+  T (&s_a)[BM][WMMA_BK + 8] = wmma_smem.work.a;
+  T (&s_b)[BN][WMMA_BK + 8] = wmma_smem.work.b;
 
   for (int k_step = 0; k_step < K; k_step += WMMA_BK) {
 
@@ -1112,7 +1140,7 @@ __global__ void nvfp4_wmma_matmul_kernel(
   }
 
   // --- Store output: from accumulators through shared memory ---
-  __shared__ float s_out[BM][BN + 4];
+  float (&s_out)[BM][BN + 4] = wmma_smem.out;
 
   #pragma unroll
   for (int fi = 0; fi < BM / 32; fi++)
@@ -1215,11 +1243,16 @@ extern "C" void nvfp4_matmul_f16(const __half *input, const uint8_t *weight,
   constexpr int BM = NVFP4_WMMA_BM, BN = NVFP4_WMMA_BN;
   dim3 block(128);
   dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
-  nvfp4_gemm::nvfp4_wmma_matmul_kernel<half, BM, BN>
-      <<<grid, block, 0, stream>>>(input, weight, weight_scale,
-                                   weight_global_scale, weight_row_scales,
-                                   bias, output, M, N, K,
-                                   has_bias, force_lut);
+  // The kernel shares one buffer between the staging area and the output
+  // area, so the allocation is the larger of the two.
+  constexpr size_t kSmem = sizeof(nvfp4_gemm::WmmaSmem<half, BM, BN>);
+  auto kernel = nvfp4_gemm::nvfp4_wmma_matmul_kernel<half, BM, BN>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       (int)kSmem);
+  kernel<<<grid, block, kSmem, stream>>>(input, weight, weight_scale,
+                                         weight_global_scale, weight_row_scales,
+                                         bias, output, M, N, K,
+                                         has_bias, force_lut);
 }
 
 #ifndef NO_BF16_KERNEL

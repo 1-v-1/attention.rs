@@ -170,6 +170,13 @@ fn main() -> Result<()> {
         builder = builder.arg("-DNO_MARLIN_KERNEL");
     }
 
+    // The number of output rows a decode block covers.  More rows per block
+    // means the activation row is staged once for more output columns.
+    if let Ok(v) = std::env::var("NVFP4_DECODE_BLOCK_ROWS") {
+        builder = builder.arg(&format!("-DNVFP4_DECODE_BLOCK_ROWS={v}"));
+        println!("cargo:info=NVFP4 decode block rows: {v}");
+    }
+
     // The wmma tile shape is tunable from the environment for measurements.
     for (var, define) in [
         ("NVFP4_WMMA_BM", "NVFP4_WMMA_BM"),
