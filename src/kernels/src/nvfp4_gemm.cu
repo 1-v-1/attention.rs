@@ -327,10 +327,13 @@ __device__ __forceinline__ float hw_dot_16(uint2 packed, float scale,
 #ifndef NVFP4_DECODE_BLOCK_ROWS
 #define NVFP4_DECODE_BLOCK_ROWS 8
 #endif
+#ifndef NVFP4_DECODE_BLOCK_ROWS_BATCH
+#define NVFP4_DECODE_BLOCK_ROWS_BATCH 16
+#endif
 constexpr int BLOCK_N_SM = NVFP4_DECODE_BLOCK_ROWS;
 
-template <typename T>
-__launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
+template <typename T, int ROWS>
+__launch_bounds__(ROWS * WARP_SIZE) __global__
     void nvfp4_matmul_smallm_kernel(const T *__restrict__ input,
                                     const uint8_t *__restrict__ weight,
                                     const uint8_t *__restrict__ weight_scale,
@@ -363,7 +366,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
   const int warp_id = tid / WARP_SIZE;
   const int lane_id = tid % WARP_SIZE;
   const int row = blockIdx.y;
-  const int n_base = blockIdx.x * BLOCK_N_SM;
+  const int n_base = blockIdx.x * ROWS;
   const int n_idx = n_base + warp_id;
   const int weight_row_stride = K / 2;
   const int scale_stride = CEILDIV(K, NVFP4_BLOCK_SIZE);
@@ -1177,6 +1180,41 @@ __global__ void nvfp4_wmma_matmul_kernel(
 // C API
 // ============================================================================
 
+// Launch the small-M kernel with the row count that suits the problem.
+// A single-token decode wants as many blocks as possible, because the
+// parallelism comes from the block count; a wider batch amortises the
+// activation staging over more output rows instead.
+template <typename T>
+static void launch_nvfp4_smallm(const T *input, const uint8_t *weight,
+                                const uint8_t *weight_scale,
+                                float weight_global_scale,
+                                const float *weight_row_scales, const T *bias,
+                                T *output, int M, int N, int K, bool has_bias,
+                                bool force_lut, cudaStream_t stream) {
+  constexpr int kSingle = NVFP4_DECODE_BLOCK_ROWS;
+  constexpr int kBatch = NVFP4_DECODE_BLOCK_ROWS_BATCH;
+  const size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(T);
+  if (M == 1) {
+    auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<T, kSingle>;
+    dim3 block(kSingle * WARP_SIZE);
+    dim3 grid(CEILDIV(N, kSingle), M);
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)smem);
+    kernel<<<grid, block, smem, stream>>>(
+        input, weight, weight_scale, weight_global_scale, weight_row_scales,
+        bias, output, M, N, K, has_bias, force_lut);
+  } else {
+    auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<T, kBatch>;
+    dim3 block(kBatch * WARP_SIZE);
+    dim3 grid(CEILDIV(N, kBatch), M);
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)smem);
+    kernel<<<grid, block, smem, stream>>>(
+        input, weight, weight_scale, weight_global_scale, weight_row_scales,
+        bias, output, M, N, K, has_bias, force_lut);
+  }
+}
+
 extern "C" void nvfp4_matmul_smallm_f16(const __half *input,
                                          const uint8_t *weight,
                                          const uint8_t *weight_scale,
@@ -1185,17 +1223,9 @@ extern "C" void nvfp4_matmul_smallm_f16(const __half *input,
                                          const __half *bias, __half *output,
                                          int M, int N, int K, bool has_bias,
                                          bool force_lut, cudaStream_t stream) {
-  using namespace nvfp4_gemm;
-  constexpr int THREADS = BLOCK_N_SM * WARP_SIZE;
-  dim3 block(THREADS);
-  dim3 grid(CEILDIV(N, BLOCK_N_SM), M);
-  size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(half);
-  auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<half>;
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-  kernel<<<grid, block, smem, stream>>>(input, weight, weight_scale,
-                                        weight_global_scale, weight_row_scales,
-                                        bias, output, M, N,
-                                        K, has_bias, force_lut);
+  launch_nvfp4_smallm<half>(input, weight, weight_scale, weight_global_scale,
+                            weight_row_scales, bias, output, M, N, K, has_bias,
+                            force_lut, stream);
 }
 
 #ifndef NO_BF16_KERNEL
@@ -1208,17 +1238,9 @@ extern "C" void nvfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
                                           __nv_bfloat16 *output,
                                           int M, int N, int K, bool has_bias,
                                           bool force_lut, cudaStream_t stream) {
-  using namespace nvfp4_gemm;
-  constexpr int THREADS = BLOCK_N_SM * WARP_SIZE;
-  dim3 block(THREADS);
-  dim3 grid(CEILDIV(N, BLOCK_N_SM), M);
-  size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(__nv_bfloat16);
-  auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<__nv_bfloat16>;
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-  kernel<<<grid, block, smem, stream>>>(input, weight, weight_scale,
-                                        weight_global_scale, weight_row_scales,
-                                        bias, output, M, N,
-                                        K, has_bias, force_lut);
+  launch_nvfp4_smallm<__nv_bfloat16>(
+      input, weight, weight_scale, weight_global_scale, weight_row_scales,
+      bias, output, M, N, K, has_bias, force_lut, stream);
 }
 #else
 extern "C" void nvfp4_matmul_smallm_bf16(const void *, const uint8_t *,
