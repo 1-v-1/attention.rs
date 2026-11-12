@@ -177,6 +177,11 @@ fn main() -> Result<()> {
         println!("cargo:info=NVFP4 decode block rows: {v}");
     }
 
+    if let Ok(v) = std::env::var("GDN_WARPS_PER_BLOCK") {
+        builder = builder.arg(&format!("-DGDN_WARPS_PER_BLOCK={v}"));
+        println!("cargo:info=GDN warps per block: {v}");
+    }
+
     // The wmma tile shape is tunable from the environment for measurements.
     for (var, define) in [
         ("NVFP4_WMMA_BM", "NVFP4_WMMA_BM"),

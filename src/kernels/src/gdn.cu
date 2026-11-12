@@ -1081,7 +1081,12 @@ static int launch_gated_delta_rule_decode_slots_gqa_strided(
             k_dim, v_dim, q_scale, v_offset, v_row_stride, stream) == 0) {
         return 0;
     }
-    constexpr int WARPS_PER_BLOCK = 4;
+    // Warps per block.  More warps cover more state columns at once, so the
+    // state rows stay coalesced; fewer blocks are launched in exchange.
+#ifndef GDN_WARPS_PER_BLOCK
+#define GDN_WARPS_PER_BLOCK 4
+#endif
+    constexpr int WARPS_PER_BLOCK = GDN_WARPS_PER_BLOCK;
     constexpr int COLS_PER_WARP = 4;
     dim3 grid((v_dim + WARPS_PER_BLOCK * COLS_PER_WARP - 1) /
                   (WARPS_PER_BLOCK * COLS_PER_WARP),

@@ -242,6 +242,18 @@ __device__ __forceinline__ void dequant_store_8_f16_scaled(
 // Alignment-safe uint2 load from byte-packed weight arrays.
 // V100 (SM70) can fault on misaligned uint2 loads from uint8_t* pointers;
 // SM80+ handles this fine. memcpy is optimized to a single LDG by NVCC.
+// Load the weights with the streaming hint.  A decode step walks every
+// weight exactly once, so keeping the lines in L2 buys nothing and only
+// evicts the activation row that every block shares.
+__device__ __forceinline__ uint2 load_uint2_stream(const uint8_t *ptr) {
+  // __ldcs is the streaming load: the line is marked evict-first, which is
+  // what a weight read wants, since the same bytes are never read again.
+  uint2 v;
+  v.x = __ldcs(reinterpret_cast<const int *>(ptr));
+  v.y = __ldcs(reinterpret_cast<const int *>(ptr) + 1);
+  return v;
+}
+
 __device__ __forceinline__ uint2 load_uint2_safe(const uint8_t *ptr) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
   uint2 v;
@@ -504,7 +516,7 @@ __launch_bounds__(ROWS * WARP_SIZE) __global__
           dispatch_fp8_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
           gscale * 0.5f;
 
-      uint2 w_vec = load_uint2_safe(w_row + k / 2);
+      uint2 w_vec = load_uint2_stream(w_row + k / 2);
       const T *in = s_input + (k + (k / WARP_SIZE));
 
       // The f16 tables carry the same magnitudes as the int8 tables, so the
@@ -533,7 +545,7 @@ __launch_bounds__(ROWS * WARP_SIZE) __global__
         float block_scale_b =
             dispatch_fp8_to_float(__ldg(&w_scale_row2[k / NVFP4_BLOCK_SIZE])) *
             gscale2 * 0.5f;
-        uint2 w_vec_b = load_uint2_safe(w_row2 + k / 2);
+        uint2 w_vec_b = load_uint2_stream(w_row2 + k / 2);
         float partial_b = 0.0f;
         {
           __half2 h0b[4], h1b[4];
@@ -558,7 +570,7 @@ __launch_bounds__(ROWS * WARP_SIZE) __global__
             dispatch_fp8_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
             gscale * 0.5f;
 
-        uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
+        uint2 w_vec2 = load_uint2_stream(w_row + k2 / 2);
         const T *in2 = s_input + (k2 + (k2 / WARP_SIZE));
 
         float partial2 = 0.0f;
@@ -582,7 +594,7 @@ __launch_bounds__(ROWS * WARP_SIZE) __global__
           float block_scale_b2 = dispatch_fp8_to_float(
                                      __ldg(&w_scale_row2[k2 / NVFP4_BLOCK_SIZE])) *
                                  gscale2 * 0.5f;
-          uint2 w_vec_b2 = load_uint2_safe(w_row2 + k2 / 2);
+          uint2 w_vec_b2 = load_uint2_stream(w_row2 + k2 / 2);
           float partial_b2 = 0.0f;
           {
             __half2 h2ab[4], h2bb[4];
@@ -1156,7 +1168,10 @@ __global__ void nvfp4_wmma_matmul_kernel(
             __ldg(&weight_scale[(size_t)gn * scale_stride + k_step / NVFP4_BLOCK_SIZE]))
             * row_gscale;
 
-        uint2 w_vec = load_uint2_safe(
+        // The weights are streamed once per tile, so they are loaded with
+        // the streaming hint and do not evict the activation rows that every
+        // block shares.
+        uint2 w_vec = load_uint2_stream(
             &weight[(size_t)gn * half_k + k_step / 2]);
 
         uint32_t word = sub ? w_vec.y : w_vec.x;
