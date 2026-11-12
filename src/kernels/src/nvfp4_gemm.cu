@@ -192,6 +192,42 @@ __device__ __forceinline__ void dequant_store_8_f16(int q4,
   }
 }
 
+// ---------------------------------------------------------------------------
+// WMMA fast path: produce the scaled weights straight as f16.
+//
+// The wmma kernel needs the weights as f16, and the element-wise route gets
+// there via float: every codeword becomes a float (int8 -> f32 convert), is
+// multiplied by the block scale in fp32, and is then rounded to f16.  That is
+// 8 int8->f32 converts, 8 fp32 multiplies and 8 f32->f16 converts per 8
+// codewords.
+//
+// The f16 high-byte tables below carry the same 2x E2M1 magnitudes as the
+// int8 tables (all of {0,1,2,3,4,6,8,12} are exact in f16 and have a zero low
+// byte), so the value can be taken straight out of the table as f16 and
+// scaled with a single __hmul2.  The scale itself is rounded to f16 first,
+// which is the one behavioural difference against the fp32 route.
+//
+// SM70 has no bf16 tensor cores, so this path only ever serves f16.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void dequant_store_8_f16_scaled(
+    int q4, float scale, uint32_t LUT0, uint32_t LUT1, uint32_t LUT2,
+    uint32_t LUT3, __half2 *dst4) {
+  const int2 w = get_int_from_table_16_f16(q4, LUT0, LUT1, LUT2, LUT3);
+  const uint32_t bytes[8] = {
+      (uint32_t)(w.x & 0xffu),         (uint32_t)(w.y & 0xffu),
+      (uint32_t)((w.x >> 8) & 0xffu),   (uint32_t)((w.y >> 8) & 0xffu),
+      (uint32_t)((w.x >> 16) & 0xffu),  (uint32_t)((w.y >> 16) & 0xffu),
+      (uint32_t)((w.x >> 24) & 0xffu),  (uint32_t)((w.y >> 24) & 0xffu),
+  };
+  const __half2 s = __float2half2_rn(scale);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const __half lo = __ushort_as_half((unsigned short)(bytes[2 * i] << 8));
+    const __half hi = __ushort_as_half((unsigned short)(bytes[2 * i + 1] << 8));
+    dst4[i] = __hmul2(__halves2half2(lo, hi), s);
+  }
+}
+
 // Alignment-safe uint2 load from byte-packed weight arrays.
 // V100 (SM70) can fault on misaligned uint2 loads from uint8_t* pointers;
 // SM80+ handles this fine. memcpy is optimized to a single LDG by NVCC.
@@ -860,6 +896,12 @@ __global__ void nvfp4_wmma_matmul_kernel(
   const uint32_t LUT1 = 0x0C080604;
   const uint32_t LUT2 = 0xFDFEFF00;
   const uint32_t LUT3 = 0xF4F8FAFC;
+  // f16 high-byte tables holding the same magnitudes as the int8 tables
+  // (2x E2M1), used for the f16 fast paths.
+  const uint32_t FLUT0 = 0x42403C00;
+  const uint32_t FLUT1 = 0x4A484644;
+  const uint32_t FLUT2 = 0xC2C0BC00;
+  const uint32_t FLUT3 = 0xCAC8C6C4;
 
   const int tid = threadIdx.x;
   const int warp_id = tid / 32;
@@ -883,13 +925,24 @@ __global__ void nvfp4_wmma_matmul_kernel(
 
   for (int k_step = 0; k_step < K; k_step += WMMA_BK) {
 
+    // Store two halves at a time: the row stride is 24 half (48 bytes), so
+    // single-half stores make consecutive threads hit the same shared-memory
+    // bank.  A half2 store halves the number of transactions and lets each
+    // one cover a full 4-byte word.
     #pragma unroll
-    for (int i = tid; i < BM * WMMA_BK; i += 128) {
-      int r = i / WMMA_BK;
-      int c = i % WMMA_BK;
+    for (int i = tid; i < BM * (WMMA_BK / 2); i += 128) {
+      int r = i / (WMMA_BK / 2);
+      int c = (i % (WMMA_BK / 2)) * 2;
       int gr = by * BM + r;
       int gc = k_step + c;
-      s_a[r][c] = (gr < M && gc < K) ? input[(size_t)gr * K + gc] : T(0);
+      T v0 = (gr < M && gc < K) ? input[(size_t)gr * K + gc] : T(0);
+      T v1 = (gr < M && gc + 1 < K) ? input[(size_t)gr * K + gc + 1] : T(0);
+      if constexpr (std::is_same_v<T, half>) {
+        *reinterpret_cast<__half2 *>(&s_a[r][c]) = __halves2half2(v0, v1);
+      } else {
+        s_a[r][c] = v0;
+        s_a[r][c + 1] = v1;
+      }
     }
 
     {
@@ -930,14 +983,24 @@ __global__ void nvfp4_wmma_matmul_kernel(
 #endif
         {
           float lut_scale = raw_scale * 0.5f;
-          float dq[8];
-          dequant_store_8(word, lut_scale, LUT0, LUT1, LUT2, LUT3, dq);
-          #pragma unroll
-          for (int j = 0; j < 8; j++) {
-            if constexpr (std::is_same_v<T, __half>)
-              s_b[row][col_base + j] = __float2half(dq[j]);
-            else
+          if constexpr (std::is_same_v<T, __half>) {
+            // F16 fast path: one f16 multiply per pair instead of eight
+            // int8->f32 converts, fp32 multiplies and f32->f16 converts.
+            __half2 h[4];
+            dequant_store_8_f16_scaled(word, lut_scale, FLUT0, FLUT1, FLUT2,
+                                       FLUT3, h);
+            // One 4-byte store per pair instead of two 2-byte stores.
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+              *reinterpret_cast<__half2 *>(&s_b[row][col_base + 2 * j]) = h[j];
+            }
+          } else {
+            float dq[8];
+            dequant_store_8(word, lut_scale, LUT0, LUT1, LUT2, LUT3, dq);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
               s_b[row][col_base + j] = __float2bfloat16_rn(dq[j]);
+            }
           }
         }
       } else if (row < BN) {
@@ -1062,7 +1125,11 @@ extern "C" void nvfp4_matmul_f16(const __half *input, const uint8_t *weight,
                                   const __half *bias, __half *output, int M,
                                   int N, int K, bool has_bias, bool force_lut,
                                   cudaStream_t stream) {
-#ifndef NO_BF16_KERNEL
+  // The F16 wmma path works on every arch with F16 tensor cores, Volta
+  // included (HMMA.884 on sm_70).  NO_BF16_KERNEL only exists because Volta
+  // has no BF16 tensor cores, so it must not disable the F16 variant: doing
+  // so pushed SM70 onto the fp32 tiled fallback, which is an order of
+  // magnitude slower.
   constexpr int BM = 64, BN = 64;
   dim3 block(128);
   dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
@@ -1071,18 +1138,6 @@ extern "C" void nvfp4_matmul_f16(const __half *input, const uint8_t *weight,
                                    weight_global_scale, weight_row_scales,
                                    bias, output, M, N, K,
                                    has_bias, force_lut);
-#else
-  constexpr int BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
-  constexpr int THREADS_N = BN / TN;
-  constexpr int THREADS_M = BM / TM;
-  dim3 block(THREADS_N, THREADS_M);
-  dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
-  nvfp4_gemm::nvfp4_matmul_tiled<half, BM, BN, BK, TM, TN>
-      <<<grid, block, 0, stream>>>(input, weight, weight_scale,
-                                   weight_global_scale, weight_row_scales,
-                                   bias, output, M, N, K,
-                                   has_bias, force_lut);
-#endif
 }
 
 #ifndef NO_BF16_KERNEL
