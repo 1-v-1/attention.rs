@@ -170,6 +170,17 @@ fn main() -> Result<()> {
         builder = builder.arg("-DNO_MARLIN_KERNEL");
     }
 
+    // The wmma tile shape is tunable from the environment for measurements.
+    for (var, define) in [
+        ("NVFP4_WMMA_BM", "NVFP4_WMMA_BM"),
+        ("NVFP4_WMMA_BN", "NVFP4_WMMA_BN"),
+    ] {
+        if let Ok(v) = std::env::var(var) {
+            builder = builder.arg(&format!("-D{define}={v}"));
+            println!("cargo:info=NVFP4 wmma {var}: {v}");
+        }
+    }
+
     if compute_cap < 89 {
         builder = builder.arg("-DNO_HARDWARE_FP8");
     }

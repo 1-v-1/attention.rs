@@ -97,6 +97,17 @@ __device__ __forceinline__ float2 fp8x2_scale_to_float2(uint16_t raw2) {
 // ============================================================================
 
 // --- Legacy LUT-based path (SM < 100) ---
+// Convert a staged activation element to float, whichever dtype it is
+// stored in.
+template <typename T>
+__device__ __forceinline__ float to_f32(T v) {
+  if constexpr (std::is_same_v<T, half>) {
+    return __half2float(v);
+  } else {
+    return __bfloat162float(v);
+  }
+}
+
 __device__ __forceinline__ int2 get_int_from_table_16(const int q4,
                                                       const uint32_t table0,
                                                       const uint32_t table1,
@@ -272,8 +283,9 @@ __device__ __forceinline__ void hw_dequant_16(uint2 packed, float scale,
 // Accumulates the unscaled dot product first, then applies scale once at the
 // end. This halves the number of floating-point roundings per block (16 fmafs
 // + 1 fmaf vs. 16 muls + 16 fmafs), improving precision for large K.
+template <typename T>
 __device__ __forceinline__ float hw_dot_16(uint2 packed, float scale,
-                                           const float *input) {
+                                           const T *input) {
   float acc = 0.0f;
 #pragma unroll
   for (int i = 0; i < 4; i++) {
@@ -281,8 +293,8 @@ __device__ __forceinline__ float hw_dot_16(uint2 packed, float scale,
     __half2_raw h2 = __nv_cvt_fp4x2_to_halfraw2(
         static_cast<__nv_fp4x2_storage_t>(b0), __NV_E2M1);
     float2 f2 = __half22float2(*reinterpret_cast<__half2*>(&h2));
-    acc = fmaf(input[i * 2],     f2.x, acc);
-    acc = fmaf(input[i * 2 + 1], f2.y, acc);
+    acc = fmaf(to_f32(input[i * 2]),     f2.x, acc);
+    acc = fmaf(to_f32(input[i * 2 + 1]), f2.y, acc);
   }
 #pragma unroll
   for (int i = 0; i < 4; i++) {
@@ -321,7 +333,13 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
                                     const T *__restrict__ bias,
                                     T *__restrict__ output, int M, int N,
                                     int K, bool has_bias, bool force_lut) {
-  extern __shared__ float s_input[];
+  // The activation row is staged as T (half/bf16) rather than float: the
+  // source data is 2 bytes per element, and the shared-memory footprint
+  // halves, which doubles the number of resident blocks per SM.  On Volta the
+  // shared-memory budget, not the register file, is what caps the occupancy
+  // of this kernel.
+  extern __shared__ char s_input_raw[];
+  T *s_input = reinterpret_cast<T *>(s_input_raw);
 
   const uint32_t LUT0 = 0x03020100;
   const uint32_t LUT1 = 0x0C080604;
@@ -353,12 +371,43 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
   // On SM < 80 (V100) use scalar loads to avoid misaligned float4 access.
   {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
-    for (int i = tid; i < K; i += block_size) {
-      int smem_idx = i + (i / WARP_SIZE);
-      if constexpr (std::is_same_v<T, half>) {
-        s_input[smem_idx] = __half2float(__ldg(&in_row[i]));
-      } else {
-        s_input[smem_idx] = __bfloat162float(__ldg(&in_row[i]));
+    // Stage the activation row in shared memory.  The elements are loaded as
+    // pairs: the scalar version issued one 2-byte request per element, and
+    // with only 16 elements per thread those independent requests stack up
+    // into a long latency chain that nothing hides.  A 4-byte load halves
+    // the request count, and the odd tail is handled separately.
+    if constexpr (std::is_same_v<T, half>) {
+      const __half *in_half = reinterpret_cast<const __half *>(in_row);
+      for (int i = tid; i < K / 2; i += block_size) {
+        const __half2 v = __ldg(reinterpret_cast<const __half2 *>(in_half + 2 * i));
+        // The shared row is padded by one slot every WARP_SIZE elements, so
+        // the two halves of a pair can land in different slots.
+        const int e0 = 2 * i;
+        const int e1 = 2 * i + 1;
+        s_input[e0 + (e0 / WARP_SIZE)] = __low2half(v);
+        s_input[e1 + (e1 / WARP_SIZE)] = __high2half(v);
+      }
+      if (K & 1) {
+        const int i = K - 1;
+        if (tid == 0) {
+          s_input[i + (i / WARP_SIZE)] = __ldg(&in_half[i]);
+        }
+      }
+    } else {
+      const __nv_bfloat16 *in_bf = reinterpret_cast<const __nv_bfloat16 *>(in_row);
+      for (int i = tid; i < K / 2; i += block_size) {
+        const __nv_bfloat162 v =
+            __ldg(reinterpret_cast<const __nv_bfloat162 *>(in_bf + 2 * i));
+        const int e0 = 2 * i;
+        const int e1 = 2 * i + 1;
+        s_input[e0 + (e0 / WARP_SIZE)] = __low2bfloat16(v);
+        s_input[e1 + (e1 / WARP_SIZE)] = __high2bfloat16(v);
+      }
+      if (K & 1) {
+        const int i = K - 1;
+        if (tid == 0) {
+          s_input[i + (i / WARP_SIZE)] = __ldg(&in_bf[i]);
+        }
       }
     }
 #else
@@ -374,9 +423,9 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
         int k = base + j;
         int smem_idx = k + (k / WARP_SIZE);
         if constexpr (std::is_same_v<T, half>) {
-          s_input[smem_idx] = __half2float(elems[j]);
+          s_input[smem_idx] = elems[j];
         } else {
-          s_input[smem_idx] = __bfloat162float(elems[j]);
+          s_input[smem_idx] = elems[j];
         }
       }
     }
@@ -405,7 +454,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
             fp8_scale_to_float(__ldg(&w_scale_row[k / NVFP4_BLOCK_SIZE])) *
             gscale;
         uint2 w_vec = __ldg(reinterpret_cast<const uint2 *>(w_row + k / 2));
-        const float *in = s_input + (k + (k / WARP_SIZE));
+        const T *in = s_input + (k + (k / WARP_SIZE));
         acc += hw_dot_16(w_vec, block_scale, in);
       }
 
@@ -415,7 +464,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
             fp8_scale_to_float(__ldg(&w_scale_row[k2 / NVFP4_BLOCK_SIZE])) *
             gscale;
         uint2 w_vec2 = __ldg(reinterpret_cast<const uint2 *>(w_row + k2 / 2));
-        const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
+        const T *in2 = s_input + (k2 + (k2 / WARP_SIZE));
         acc += hw_dot_16(w_vec2, block_scale2, in2);
       }
     } else
@@ -427,7 +476,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
           gscale * 0.5f;
 
       uint2 w_vec = load_uint2_safe(w_row + k / 2);
-      const float *in = s_input + (k + (k / WARP_SIZE));
+      const T *in = s_input + (k + (k / WARP_SIZE));
 
       // The f16 tables carry the same magnitudes as the int8 tables, so the
       // FMA inputs stay bit-identical while the per-element shift /
@@ -442,10 +491,10 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
         for (int i = 0; i < 4; ++i) {
           const float2 a = __half22float2(h0[i]);
           const float2 b = __half22float2(h1[i]);
-          partial = fmaf(in[2 * i], a.x, partial);
-          partial = fmaf(in[2 * i + 1], a.y, partial);
-          partial = fmaf(in[8 + 2 * i], b.x, partial);
-          partial = fmaf(in[8 + 2 * i + 1], b.y, partial);
+          partial = fmaf(to_f32(in[2 * i]), a.x, partial);
+          partial = fmaf(to_f32(in[2 * i + 1]), a.y, partial);
+          partial = fmaf(to_f32(in[8 + 2 * i]), b.x, partial);
+          partial = fmaf(to_f32(in[8 + 2 * i + 1]), b.y, partial);
         }
       }
       acc = fmaf(partial, block_scale, acc);
@@ -457,7 +506,7 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
             gscale * 0.5f;
 
         uint2 w_vec2 = load_uint2_safe(w_row + k2 / 2);
-        const float *in2 = s_input + (k2 + (k2 / WARP_SIZE));
+        const T *in2 = s_input + (k2 + (k2 / WARP_SIZE));
 
         float partial2 = 0.0f;
         {
@@ -468,10 +517,10 @@ __launch_bounds__(BLOCK_N_SM * WARP_SIZE) __global__
           for (int i = 0; i < 4; ++i) {
             const float2 a = __half22float2(h2a[i]);
             const float2 b = __half22float2(h2b[i]);
-            partial2 = fmaf(in2[2 * i], a.x, partial2);
-            partial2 = fmaf(in2[2 * i + 1], a.y, partial2);
-            partial2 = fmaf(in2[8 + 2 * i], b.x, partial2);
-            partial2 = fmaf(in2[8 + 2 * i + 1], b.y, partial2);
+            partial2 = fmaf(to_f32(in2[2 * i]), a.x, partial2);
+            partial2 = fmaf(to_f32(in2[2 * i + 1]), a.y, partial2);
+            partial2 = fmaf(to_f32(in2[8 + 2 * i]), b.x, partial2);
+            partial2 = fmaf(to_f32(in2[8 + 2 * i + 1]), b.y, partial2);
           }
         }
         acc = fmaf(partial2, block_scale2, acc);
@@ -792,10 +841,10 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
           for (int i = 0; i < 4; ++i) {
             const float2 a = __half22float2(h0[i]);
             const float2 b = __half22float2(h1[i]);
-            partial = fmaf(in[2 * i], a.x, partial);
-            partial = fmaf(in[2 * i + 1], a.y, partial);
-            partial = fmaf(in[8 + 2 * i], b.x, partial);
-            partial = fmaf(in[8 + 2 * i + 1], b.y, partial);
+            partial = fmaf(to_f32(in[2 * i]), a.x, partial);
+            partial = fmaf(to_f32(in[2 * i + 1]), a.y, partial);
+            partial = fmaf(to_f32(in[8 + 2 * i]), b.x, partial);
+            partial = fmaf(to_f32(in[8 + 2 * i + 1]), b.y, partial);
           }
         }
         acc = fmaf(partial, block_scale, acc);
@@ -818,10 +867,10 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
             for (int i = 0; i < 4; ++i) {
               const float2 a = __half22float2(h2a[i]);
               const float2 b = __half22float2(h2b[i]);
-              partial2 = fmaf(in2[2 * i], a.x, partial2);
-              partial2 = fmaf(in2[2 * i + 1], a.y, partial2);
-              partial2 = fmaf(in2[8 + 2 * i], b.x, partial2);
-              partial2 = fmaf(in2[8 + 2 * i + 1], b.y, partial2);
+              partial2 = fmaf(to_f32(in2[2 * i]), a.x, partial2);
+              partial2 = fmaf(to_f32(in2[2 * i + 1]), a.y, partial2);
+              partial2 = fmaf(to_f32(in2[8 + 2 * i]), b.x, partial2);
+              partial2 = fmaf(to_f32(in2[8 + 2 * i + 1]), b.y, partial2);
             }
           }
           acc = fmaf(partial2, block_scale2, acc);
@@ -876,6 +925,16 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
 // Double-buffering for shared memory to overlap dequant with compute.
 // ============================================================================
 
+// Tile shape for the wmma path.  Measured on a V100: 64x64 was the best
+// combination.  A wider BN amortises the activation load over more output
+// columns, but the weight staging then has to cover twice as many rows, and
+// the larger shared-memory footprint costs more than the reuse gains.
+#ifndef NVFP4_WMMA_BM
+#define NVFP4_WMMA_BM 64
+#endif
+#ifndef NVFP4_WMMA_BN
+#define NVFP4_WMMA_BN 64
+#endif
 #define WMMA_BK 16
 
 template <typename T, int BM, int BN>
@@ -910,14 +969,20 @@ __global__ void nvfp4_wmma_matmul_kernel(
   const int scale_stride = CEILDIV(K, NVFP4_BLOCK_SIZE);
   const int half_k = K / 2;
 
-  const int warp_row = (warp_id / 2) * 32;
-  const int warp_col = (warp_id % 2) * 32;
+  // Tile shape.  A 64x64 tile yields only N/64 * M/64 blocks, which on a
+  // Volta with 80 SMs leaves barely one warp per sub-partition and no way to
+  // hide any latency.  Making the tile configurable lets the shape be
+  // chosen for the block count of the actual problem.
+  // The four warps of a block form a 2x2 grid over the tile, so each warp
+  // owns BM/32 rows and BN/32 columns of 16-wide fragments.
+  const int warp_row = (warp_id / 2) * (BM / 2);
+  const int warp_col = (warp_id % 2) * (BN / 2);
 
-  fragment<accumulator, 16, 16, 16, float> acc[2][2];
+  fragment<accumulator, 16, 16, 16, float> acc[BM / 32][BN / 32];
   #pragma unroll
-  for (int i = 0; i < 2; i++)
+  for (int i = 0; i < BM / 32; i++)
     #pragma unroll
-    for (int j = 0; j < 2; j++)
+    for (int j = 0; j < BN / 32; j++)
       fill_fragment(acc[i][j], 0.0f);
 
   __shared__ T s_a[BM][WMMA_BK + 8];
@@ -930,23 +995,39 @@ __global__ void nvfp4_wmma_matmul_kernel(
     // bank.  A half2 store halves the number of transactions and lets each
     // one cover a full 4-byte word.
     #pragma unroll
-    for (int i = tid; i < BM * (WMMA_BK / 2); i += 128) {
-      int r = i / (WMMA_BK / 2);
-      int c = (i % (WMMA_BK / 2)) * 2;
-      int gr = by * BM + r;
-      int gc = k_step + c;
-      T v0 = (gr < M && gc < K) ? input[(size_t)gr * K + gc] : T(0);
-      T v1 = (gr < M && gc + 1 < K) ? input[(size_t)gr * K + gc + 1] : T(0);
-      if constexpr (std::is_same_v<T, half>) {
-        *reinterpret_cast<__half2 *>(&s_a[r][c]) = __halves2half2(v0, v1);
-      } else {
-        s_a[r][c] = v0;
-        s_a[r][c + 1] = v1;
+    // Load eight halves at a time.  The scalar version issued one 2-byte
+    // request per element, and with 16 elements per thread those independent
+    // requests pile up into a latency chain that the barrier right after has
+    // to wait for.  K is a multiple of 16, so the rows stay 16-byte aligned.
+    constexpr int ELEMS_PER_VEC = 8; // 8 halves = 16 bytes = 128 bits
+    const int K_vec = K / ELEMS_PER_VEC;
+    const float4 *in_vec = reinterpret_cast<const float4 *>(input);
+    for (int i = tid; i < BM * (WMMA_BK / ELEMS_PER_VEC); i += 128) {
+      const int r = i / (WMMA_BK / ELEMS_PER_VEC);
+      const int c = (i % (WMMA_BK / ELEMS_PER_VEC)) * ELEMS_PER_VEC;
+      const int gr = by * BM + r;
+      const int gc = k_step + c;
+      float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (gr < M && gc + ELEMS_PER_VEC <= K) {
+        v = in_vec[(size_t)gr * K_vec + (gc / ELEMS_PER_VEC)];
+      } else if (gr < M) {
+        T tmp[ELEMS_PER_VEC];
+        #pragma unroll
+        for (int j = 0; j < ELEMS_PER_VEC; ++j)
+          tmp[j] = (gc + j < K) ? input[(size_t)gr * K + gc + j] : T(0);
+        v = *reinterpret_cast<const float4 *>(tmp);
       }
+      const T *elems = reinterpret_cast<const T *>(&v);
+      #pragma unroll
+      for (int j = 0; j < ELEMS_PER_VEC; ++j)
+        s_a[r][c + j] = elems[j];
     }
 
-    {
-      int row = tid / 2;
+    // One warp per two rows of the tile: the 32 lanes split into 16 rows
+    // times the two halves of the packed weight word.  When the tile is
+    // wider than 64 rows the loop walks the extra rows as well, otherwise
+    // half of s_b would be left uninitialized.
+    for (int row = tid / 2; row < BN; row += blockDim.x / 2) {
       int sub = tid & 1;
       int gn = bx * BN + row;
 
@@ -1011,6 +1092,7 @@ __global__ void nvfp4_wmma_matmul_kernel(
       }
     }
 
+
     __syncthreads();
 
     // --- WMMA compute ---
@@ -1018,9 +1100,9 @@ __global__ void nvfp4_wmma_matmul_kernel(
     fragment<matrix_b, 16, 16, 16, T, col_major> b_frag;
 
     #pragma unroll
-    for (int fi = 0; fi < 2; fi++) {
+    for (int fi = 0; fi < BM / 32; fi++) {
       #pragma unroll
-      for (int fj = 0; fj < 2; fj++) {
+      for (int fj = 0; fj < BN / 32; fj++) {
         load_matrix_sync(a_frag, &s_a[warp_row + fi * 16][0], WMMA_BK + 8);
         load_matrix_sync(b_frag, &s_b[warp_col + fj * 16][0], WMMA_BK + 8);
         mma_sync(acc[fi][fj], a_frag, b_frag, acc[fi][fj]);
@@ -1033,9 +1115,9 @@ __global__ void nvfp4_wmma_matmul_kernel(
   __shared__ float s_out[BM][BN + 4];
 
   #pragma unroll
-  for (int fi = 0; fi < 2; fi++)
+  for (int fi = 0; fi < BM / 32; fi++)
     #pragma unroll
-    for (int fj = 0; fj < 2; fj++)
+    for (int fj = 0; fj < BN / 32; fj++)
       store_matrix_sync(&s_out[warp_row + fi * 16][warp_col + fj * 16],
                         acc[fi][fj], BN + 4, mem_row_major);
   __syncthreads();
@@ -1079,7 +1161,7 @@ extern "C" void nvfp4_matmul_smallm_f16(const __half *input,
   constexpr int THREADS = BLOCK_N_SM * WARP_SIZE;
   dim3 block(THREADS);
   dim3 grid(CEILDIV(N, BLOCK_N_SM), M);
-  size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(float);
+  size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(half);
   auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<half>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   kernel<<<grid, block, smem, stream>>>(input, weight, weight_scale,
@@ -1102,7 +1184,7 @@ extern "C" void nvfp4_matmul_smallm_bf16(const __nv_bfloat16 *input,
   constexpr int THREADS = BLOCK_N_SM * WARP_SIZE;
   dim3 block(THREADS);
   dim3 grid(CEILDIV(N, BLOCK_N_SM), M);
-  size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(float);
+  size_t smem = (K + CEILDIV(K, WARP_SIZE)) * sizeof(__nv_bfloat16);
   auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<__nv_bfloat16>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   kernel<<<grid, block, smem, stream>>>(input, weight, weight_scale,
@@ -1130,7 +1212,7 @@ extern "C" void nvfp4_matmul_f16(const __half *input, const uint8_t *weight,
   // has no BF16 tensor cores, so it must not disable the F16 variant: doing
   // so pushed SM70 onto the fp32 tiled fallback, which is an order of
   // magnitude slower.
-  constexpr int BM = 64, BN = 64;
+  constexpr int BM = NVFP4_WMMA_BM, BN = NVFP4_WMMA_BN;
   dim3 block(128);
   dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
   nvfp4_gemm::nvfp4_wmma_matmul_kernel<half, BM, BN>
