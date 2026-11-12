@@ -406,7 +406,10 @@ __launch_bounds__(ROWS * WARP_SIZE) __global__
     if constexpr (std::is_same_v<T, half>) {
       const __half *in_half = reinterpret_cast<const __half *>(in_row);
       for (int i = tid; i < K / 2; i += block_size) {
-        const __half2 v = __ldg(reinterpret_cast<const __half2 *>(in_half + 2 * i));
+        // The activation row is read by every warp of the block and by every
+        // block, so it wants to stay in the caches; __ldca asks for that
+        // explicitly.
+        const __half2 v = __ldca(reinterpret_cast<const __half2 *>(in_half + 2 * i));
         // The shared row is padded by one slot every WARP_SIZE elements, so
         // the two halves of a pair can land in different slots.
         const int e0 = 2 * i;
@@ -424,7 +427,7 @@ __launch_bounds__(ROWS * WARP_SIZE) __global__
       const __nv_bfloat16 *in_bf = reinterpret_cast<const __nv_bfloat16 *>(in_row);
       for (int i = tid; i < K / 2; i += block_size) {
         const __nv_bfloat162 v =
-            __ldg(reinterpret_cast<const __nv_bfloat162 *>(in_bf + 2 * i));
+            __ldca(reinterpret_cast<const __nv_bfloat162 *>(in_bf + 2 * i));
         const int e0 = 2 * i;
         const int e1 = 2 * i + 1;
         s_input[e0 + (e0 / WARP_SIZE)] = __low2bfloat16(v);
