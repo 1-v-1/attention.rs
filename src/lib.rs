@@ -838,8 +838,35 @@ impl PagedAttention {
                     matches!(group_size, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64);
                 let flashinfer_decode_group_supported =
                     flashinfer_prefill_group_supported && !(group_size == 64 && head_size > 128);
+                // FlashInfer's *prefill* kernels do not run on Volta/Turing.
+                //
+                // At head_dim 256 the q/k/v staging union already fills the
+                // 64 KiB opt-in shared-memory budget of SM70/SM75, so
+                // `cudaFuncSetAttribute` and the launch itself fail with
+                // CUDA_ERROR_LAUNCH_FAILED ("unspecified launch failure") at
+                // flashinfer/attention/prefill.cuh, in `cudaLaunchKernel_ptsz`.
+                //
+                // That failure is asynchronous: the CUDA context is left in an
+                // error state and the *next* CUDA call reports it.  Under
+                // tensor parallelism that next call is typically the NCCL
+                // collective, so the user sees `Err(NcclError)` instead of the
+                // real cause.
+                //
+                // FlashInfer's *decode* kernels do work on SM70 (verified on a
+                // V100), so only the prefill path is gated here.
+                let flashinfer_prefill_sm_supported = if input_metadata.is_prefill {
+                    query
+                        .device()
+                        .as_cuda_device()
+                        .ok()
+                        .and_then(|d| crate::cuda_utils::sm_version(d))
+                        .map(|sm| sm >= 80)
+                        .unwrap_or(false)
+                } else {
+                    true
+                };
                 let flashinfer_group_supported = if input_metadata.is_prefill {
-                    flashinfer_prefill_group_supported
+                    flashinfer_prefill_group_supported && flashinfer_prefill_sm_supported
                 } else {
                     flashinfer_decode_group_supported
                 };
@@ -933,6 +960,7 @@ impl PagedAttention {
                     group_size = group_size,
                     head_size = head_size,
                     is_prefill = input_metadata.is_prefill,
+                    prefill_sm_supported = flashinfer_prefill_sm_supported,
                     "flashinfer disabled for this layer: unsupported gqa/head_dim combination, falling back"
                 );
                 }

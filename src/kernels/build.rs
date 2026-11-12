@@ -117,9 +117,25 @@ fn main() -> Result<()> {
 
     let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default());
 
+    // `--threads=N` for nvcc.  The FlashInfer adapter translation units are
+    // template-heavy, and a single one of them can take tens of minutes to
+    // compile with the default of 2 because `cicc` otherwise runs
+    // single-threaded.  Allow the build to raise it.
+    let nvcc_threads = std::env::var("XINFER_NVCC_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(8);
+    if nvcc_threads != 2 {
+        println!("cargo:info=nvcc --threads={nvcc_threads}");
+    }
+
     let mut builder = KernelBuilder::new()
         .source_dir("src")
-        .nvcc_thread_patterns(&["flash_api", "flash_decode", "cutlass", "flashinfer"], 2)
+        .nvcc_thread_patterns(
+            &["flash_api", "flash_decode", "cutlass", "flashinfer"],
+            nvcc_threads,
+        )
         .arg("--expt-relaxed-constexpr")
         .arg("-O3");
 
