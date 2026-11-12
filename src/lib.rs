@@ -838,13 +838,21 @@ impl PagedAttention {
                     matches!(group_size, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64);
                 let flashinfer_decode_group_supported =
                     flashinfer_prefill_group_supported && !(group_size == 64 && head_size > 128);
-                // FlashInfer's *prefill* kernels do not run on Volta/Turing.
+                // FlashInfer's *prefill* kernels do not run on Volta (SM70).
                 //
-                // At head_dim 256 the q/k/v staging union already fills the
-                // 64 KiB opt-in shared-memory budget of SM70/SM75, so
-                // `cudaFuncSetAttribute` and the launch itself fail with
-                // CUDA_ERROR_LAUNCH_FAILED ("unspecified launch failure") at
-                // flashinfer/attention/prefill.cuh, in `cudaLaunchKernel_ptsz`.
+                // The paged-prefill kernel copies the KV tiles with
+                // `cp.async` (`__pipeline`), which is an SM80+ instruction.
+                // On SM70 the kernel cannot be lowered, so registering it
+                // fails and the launch reports
+                // CUDA_ERROR_LAUNCH_FAILED ("unspecified launch failure").
+                // The failure surfaces from
+                // `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, before the
+                // kernel ever runs.
+                //
+                // This is not a shared-memory limit: the probe in
+                // `tests/probes/flashinfer_sm70_prefill_probe.rs` fails the
+                // same way at head_dim 32, 64, 128 and 256.  FlashInfer
+                // documents "SM75 (Turing) and later" anyway.
                 //
                 // That failure is asynchronous: the CUDA context is left in an
                 // error state and the *next* CUDA call reports it.  Under

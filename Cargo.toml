@@ -10,6 +10,11 @@ readme = "ReadMe.md"
 keywords = ["attention", "mamba", "moe", "flashinfer", "candle", "inference", "rust"]
 categories = ["algorithms", "hardware-support", "science"]
 license = "MIT"
+# This crate links the native CUDA/C++ archives built by the `kernels` crate.
+# Declaring `links` lets its build script forward the link directives to
+# this crate's own dependents, which otherwise fail to link with undefined
+# references to the C++ runtime.
+links = "attention_rs"
 
 [dependencies]
 candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "8ac335c" }

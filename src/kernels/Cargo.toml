@@ -5,6 +5,11 @@ edition = "2021"
 description = "Attention, MoE and GEMM kernels for Rust"
 categories = ["science"]
 license = "MIT OR Apache-2.0"
+# The crate builds and links native CUDA/C++ archives.  Declaring `links`
+# makes cargo hand the build script's metadata to dependent crates, so the
+# attention.rs wrapper can forward the link directives to its own
+# dependents (binaries, examples, integration tests).
+links = "kernels"
 
 [dependencies]
 

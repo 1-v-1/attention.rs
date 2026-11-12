@@ -429,5 +429,24 @@ fn main() -> Result<()> {
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=cublas");
 
+    // `links = "kernels"` makes cargo export this metadata to dependent
+    // crates as `DEP_KERNELS_*`.  attention.rs reads it in its own build
+    // script and re-emits the link directives, so that binaries, examples
+    // and integration tests that depend on attention.rs directly also get
+    // the native archives on their link line.  Without this, such targets
+    // fail to link with "undefined reference to std::__throw_system_error"
+    // and friends.
+    //
+    // Each directive needs its own key: cargo's `links` metadata is a
+    // single key-value pair per key, so repeating a key would overwrite
+    // the previous value.
+    println!("cargo:lib_search={}", build_dir.display());
+    println!("cargo:lib_pagedattention=pagedattention");
+    if link_flashmla {
+        println!("cargo:lib_flashmla=static=flashmla_dsv4");
+    }
+    println!("cargo:lib_cudart=dylib=cudart");
+    println!("cargo:lib_cublas=dylib=cublas");
+
     Ok(())
 }
