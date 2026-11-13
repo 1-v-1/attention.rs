@@ -765,14 +765,11 @@ extern "C" void nvfp4_matmul_hmma884_f16(const __half *input,
 // original nibbles with the software LUT and applies the folded scale the
 // same way, so any difference points at the repack.
 // ---------------------------------------------------------------------------
-extern "C" void nvfp4_sm70_repack_check(const uint8_t *__restrict__ weight,
-                                         const uint8_t *__restrict__ weight_scale,
-                                         const uint32_t *__restrict__ weight_out,
-                                         const __half *__restrict__ scale_out,
-                                         float global_scale, int N, int K,
-                                         float *__restrict__ out_diff,
-                                         int *__restrict__ out_mismatch,
-                                         int max_cols) {
+__global__ void nvfp4_sm70_repack_check_kernel(
+    const uint8_t *__restrict__ weight, const uint8_t *__restrict__ weight_scale,
+    const uint32_t *__restrict__ weight_out, const __half *__restrict__ scale_out,
+    float global_scale, int N, int K, float *__restrict__ out_diff,
+    int *__restrict__ out_mismatch, int max_cols) {
   // The FP4 E2M1 values, indexed by the nibble.
   const float lut[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,
                          6.0f,  -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f,
@@ -808,4 +805,21 @@ extern "C" void nvfp4_sm70_repack_check(const uint8_t *__restrict__ weight,
     if (d > out_diff[0]) out_diff[0] = d;
     if (a != b) atomicAdd(out_mismatch, 1);
   }
+}
+
+extern "C" void nvfp4_sm70_repack_check(const uint8_t *__restrict__ weight,
+                                         const uint8_t *__restrict__ weight_scale,
+                                         const uint32_t *__restrict__ weight_out,
+                                         const __half *__restrict__ scale_out,
+                                         float global_scale, int N, int K,
+                                         float *__restrict__ out_diff,
+                                         int *__restrict__ out_mismatch,
+                                         int max_cols, cudaStream_t stream) {
+  const int cols = N < max_cols ? N : max_cols;
+  const int total = cols * K;
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  nvfp4_sm70_repack_check_kernel<<<blocks, threads, 0, stream>>>(
+      weight, weight_scale, weight_out, scale_out, global_scale, N, K,
+      out_diff, out_mismatch, max_cols);
 }
