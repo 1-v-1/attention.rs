@@ -257,6 +257,23 @@ void flashinfer_decode_plan_wrapper(
                     plan_info_out[8] = plan_info.enable_cuda_graph;
                     plan_info_out[9] = plan_info.split_kv;
                 }
+                // Diagnostic: the plan values decide the launch geometry, and
+                // an empty grid is the only way the launch fails with
+                // "invalid configuration argument".
+                static int plan_diag_printed = 0;
+                if (plan_diag_printed < 4) {
+                    plan_diag_printed++;
+                    fprintf(stderr,
+                            "[flashinfer][decode_plan] pbs=%u split_kv=%d graph=%d bs=%d "
+                            "qo=%u kv=%u hd=%u page=%d indptr0=%d indptrN=%d\n",
+                            (unsigned)plan_info.padded_batch_size, (int)plan_info.split_kv,
+                            (int)plan_info.enable_cuda_graph, (int)batch_size,
+                            (unsigned)num_qo_heads, (unsigned)num_kv_heads,
+                            (unsigned)head_dim, (int)page_size,
+                            (int)indptr_host[0],
+                            (int)indptr_host[batch_size]);
+                    fflush(stderr);
+                }
             });
         });
     };
