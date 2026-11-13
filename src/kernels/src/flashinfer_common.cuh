@@ -278,6 +278,71 @@ static inline bool IsSupportedDecodeHeadDimForGroupSize(uint32_t group_size, uin
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// Dispatch selection.
+//
+// The SM70 build uses the reduced sets above; every other architecture uses
+// the full FlashInfer dispatch.
+// ---------------------------------------------------------------------------
+#if defined(SM_70_PASS)
+#define FLASHINFER_DISPATCH_HEAD_DIM DISPATCH_HEAD_DIM_SM70
+#define FLASHINFER_DISPATCH_GQA_GROUP_SIZE DISPATCH_GQA_GROUP_SIZE_SM70
+#else
+#define FLASHINFER_DISPATCH_HEAD_DIM DISPATCH_HEAD_DIM
+#define FLASHINFER_DISPATCH_GQA_GROUP_SIZE DISPATCH_GQA_GROUP_SIZE
+#endif
+
+// ---------------------------------------------------------------------------
+// SM70 (Volta) dispatch.
+//
+// The generic FlashInfer dispatch instantiates the paged-KV decode plan for
+// every combination of head dimension and GQA group size: three head
+// dimensions times ten group sizes is thirty template instantiations, each
+// of which drags in the whole CUTLASS and FlashInfer template stack.  `cicc`
+// compiles the instantiations of a single translation unit serially, so that
+// one file takes fifty minutes on its own.
+//
+// Volta has no tensor-core path for the wider head dimensions and the
+// models that run there use a handful of group sizes, so the build
+// instantiates only those.  The set is a superset of what the SM70 models
+// need, and the runtime still rejects anything outside it.
+// ---------------------------------------------------------------------------
+#if defined(SM_70_PASS)
+#define DISPATCH_HEAD_DIM_SM70(HEAD_DIM_VALUE, HEAD_DIM, ...) \
+    if ((HEAD_DIM_VALUE) == 128) {                             \
+        constexpr uint32_t HEAD_DIM = 128;                     \
+        __VA_ARGS__;                                           \
+    } else if ((HEAD_DIM_VALUE) == 256) {                      \
+        constexpr uint32_t HEAD_DIM = 256;                     \
+        __VA_ARGS__;                                           \
+    } else {                                                   \
+        return;                                                \
+    }
+
+// The group sizes a Volta model can produce: MHA (1), MQA (2), grouped
+// query with two or four groups, and the eight-way grouping that the
+// Qwen3 family uses.
+#define DISPATCH_GQA_GROUP_SIZE_SM70(group_size, GROUP_SIZE, ...) \
+    if ((group_size) == 1) {                                    \
+        constexpr size_t GROUP_SIZE = 1;                        \
+        __VA_ARGS__                                             \
+    } else if ((group_size) == 2) {                             \
+        constexpr size_t GROUP_SIZE = 2;                        \
+        __VA_ARGS__                                             \
+    } else if ((group_size) == 4) {                             \
+        constexpr size_t GROUP_SIZE = 4;                        \
+        __VA_ARGS__                                             \
+    } else if ((group_size) == 6) {                             \
+        constexpr size_t GROUP_SIZE = 6;                        \
+        __VA_ARGS__                                             \
+    } else if ((group_size) == 8) {                             \
+        constexpr size_t GROUP_SIZE = 8;                        \
+        __VA_ARGS__                                             \
+    } else {                                                    \
+        return;                                                 \
+    }
+#endif
+
 #if defined(SM_90_PASS)
 #define DISPATCH_HEAD_DIM_SM90(HEAD_DIM_VALUE, HEAD_DIM, ...) \
     if ((HEAD_DIM_VALUE) == 64) {                              \

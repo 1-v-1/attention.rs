@@ -183,8 +183,8 @@ void flashinfer_decode_plan_wrapper(
             using DTypeOut = DTypeQ;
             using IdType = int32_t;
 
-            DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-                DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
+            FLASHINFER_DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+                FLASHINFER_DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
                     using AttentionType = DefaultDecodeAttention;
                     using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
@@ -229,8 +229,8 @@ void flashinfer_decode_plan_wrapper(
         using DTypeOut = DTypeKV;
         using IdType = int32_t;
 
-        DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-            DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
+        FLASHINFER_DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+            FLASHINFER_DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
                 using AttentionType = DefaultDecodeAttention;
                 using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
@@ -329,7 +329,7 @@ void flashinfer_decode_run_wrapper(
             using DTypeOut = DTypeQ;
             using IdType = int32_t;
 
-            DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+            FLASHINFER_DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
                 paged_kv_t<DTypeKV, IdType> paged_kv(
                     num_kv_heads, page_size, head_dim, batch_size, QKVLayout::kNHD,
                     (DTypeKV*)k_data, (DTypeKV*)v_data,
@@ -393,7 +393,7 @@ void flashinfer_decode_run_wrapper(
         using DTypeOut = DTypeKV;
         using IdType = int32_t;
         
-        DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+        FLASHINFER_DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
             paged_kv_t<DTypeKV, IdType> paged_kv(
                 num_kv_heads, page_size, head_dim, batch_size, QKVLayout::kNHD,
                 (DTypeKV*)k_data, (DTypeKV*)v_data,

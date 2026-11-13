@@ -115,7 +115,7 @@ void flashinfer_prefill_run_fp8_fa2(
         std::vector<int64_t> vec(plan_data, plan_data + 15);
         plan_info.FromVector(vec);
 
-        DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+        FLASHINFER_DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
             paged_kv_t<DTypeKV, IdType> paged_kv(
                 num_kv_heads, page_size, head_dim, batch_size, QKVLayout::kNHD,
                 (DTypeKV*)k_data, (DTypeKV*)v_data,

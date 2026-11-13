@@ -216,7 +216,7 @@ void flashinfer_prefill_ragged_wrapper(
             tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
         }
         using AttentionType = DefaultAttentionAlias<false, false, false, false>;
-        DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+        FLASHINFER_DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
             DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
                 BatchPrefillWithRaggedKVCacheDispatched<
                     CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
@@ -451,7 +451,7 @@ void flashinfer_prefill_run_wrapper(
             using DTypeOut = DTypeKV;
             using IdType = int32_t;
 
-            DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+            FLASHINFER_DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
                 paged_kv_t<DTypeKV, IdType> paged_kv(
                     num_kv_heads, page_size, head_dim, batch_size, QKVLayout::kNHD,
                     (DTypeKV*)k_data, (DTypeKV*)v_data,

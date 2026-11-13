@@ -141,13 +141,40 @@ fn main() -> Result<()> {
     // FlashInfer adapters whose single translation unit takes tens of
     // minutes in `cicc`.
     //
-    // Pinning the output directory to a stable path under the crate keeps
-    // the cache alive across rebuilds, so only the files that actually
-    // changed are compiled again.
-    let stable_out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("cuda-kernels")
-        .join(std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string()));
+    // Pinning the output directory to a stable path keeps the cache alive
+    // across rebuilds, so only the files that actually changed are compiled
+    // again.
+    //
+    // The path must not live inside the crate directory.  When this crate is
+    // consumed as a git dependency, cargo checks it out under
+    // `<cargo-git-checkouts>/<crate>/<rev>/`, so a path derived from
+    // `CARGO_MANIFEST_DIR` changes with every revision and throws the whole
+    // kernel cache away.  Recompiling all ~77 translation units -- one of
+    // which takes fifty minutes in `cicc` on its own -- for every kernel
+    // change is not an acceptable turnaround time.
+    //
+    // The cache therefore lives under the cargo target directory of the
+    // *workspace* that drives the build, which is stable across revisions.
+    // `OUT_DIR` is `<target>/<profile>/build/<crate>-<hash>/out`, so
+    // `ancestors().nth(3)` is `<target>`.
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default());
+    let workspace_target = out_dir.ancestors().nth(3).map(Path::to_path_buf);
+    let stable_out_dir = match workspace_target {
+        // Sanity check: the path has to end in the cargo target directory,
+        // otherwise the ancestors walk did not land where we expect.
+        Some(t) if t.file_name().is_some_and(|n| n == "target") => {
+            t.join("cuda-kernels").join(&profile)
+        }
+        _ => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("cuda-kernels")
+            .join(&profile),
+    };
+    println!(
+        "cargo:info=cuda kernel cache: {}",
+        stable_out_dir.display()
+    );
 
     let mut builder = KernelBuilder::new()
         .out_dir(&stable_out_dir)
@@ -295,6 +322,14 @@ fn main() -> Result<()> {
             if (90..100).contains(&compute_cap) {
                 builder = builder.arg("-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED");
                 builder = builder.arg("-DSM_90_PASS");
+            }
+            // Volta and Turing build the FlashInfer paged-KV templates with a
+            // reduced set of head dimensions and group sizes.  The full
+            // dispatch instantiates thirty template combinations, and the
+            // single translation unit that holds them takes fifty minutes in
+            // `cicc` on its own.
+            if compute_cap < 80 {
+                builder = builder.arg("-DSM_70_PASS");
             }
             let flashinfer_sw_fp8 = std::env::var("ENABLE_FLASHINFER_SOFTWARE_FP8").is_ok();
             // SM70/SM75 (Volta/Turing) have no hardware FP8, but the FA2 batch
