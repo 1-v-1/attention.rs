@@ -437,16 +437,24 @@ pub fn nvfp4_matmul(
     let k = input_dims[1];
     let n = weight_dims[0];
 
-    if k % NVFP4_BLOCK_SIZE != 0 {
-        candle_core::bail!("nvfp4_matmul: K must be divisible by {NVFP4_BLOCK_SIZE}, got K={k}");
-    }
-    if weight_dims[1] != k / 2 {
-        candle_core::bail!(
-            "nvfp4_matmul: weight shape mismatch, expected [N, K/2]=[{}, {}], got {:?}",
-            n,
-            k / 2,
-            weight_dims
-        );
+    // A weight that has already been repacked for the SM70 HMMA.884 kernel
+    // arrives as u32 instead of the packed u8, so the shape check below is
+    // skipped for it.
+    let prepacked_sm70 = weight.dtype() == DType::U32;
+    if !prepacked_sm70 {
+        if k % NVFP4_BLOCK_SIZE != 0 {
+            candle_core::bail!(
+                "nvfp4_matmul: K must be divisible by {NVFP4_BLOCK_SIZE}, got K={k}"
+            );
+        }
+        if weight_dims[1] != k / 2 {
+            candle_core::bail!(
+                "nvfp4_matmul: weight shape mismatch, expected [N, K/2]=[{}, {}], got {:?}",
+                n,
+                k / 2,
+                weight_dims
+            );
+        }
     }
 
     let dev = input.device();
@@ -478,6 +486,21 @@ pub fn nvfp4_matmul(
 
             let output = Tensor::zeros((m, n), dtype, dev)?;
             let has_bias = bias.is_some();
+
+            // A repacked weight can only be read by the SM70 kernel.  Every
+            // other path expects the packed u8 layout and would silently
+            // produce garbage, so refuse instead.
+            if prepacked_sm70
+                && !(use_sm70_hmma884(cuda_dev)
+                    && dtype == DType::F16
+                    && k % 16 == 0
+                    && weight_scale_swizzled.is_none())
+            {
+                candle_core::bail!(
+                    "nvfp4_matmul: the weight is repacked for the SM70 HMMA.884 kernel, \
+                     which this device and dtype cannot use"
+                );
+            }
 
             if use_flashinfer_fp4 || use_hardware_fp4 {
                 #[cfg(feature = "cutlass")]
@@ -770,7 +793,13 @@ pub fn nvfp4_matmul(
                 // SM70 (Volta) HMMA.884 path: the weights are repacked once
                 // per layer and cached, then every step runs on the tensor
                 // cores with `mma.m8n8k4`.
-                let (repacked_weight, repacked_scale) =
+                //
+                // When the weight arrives already repacked -- it was done at
+                // load time so that the packed original could be dropped --
+                // there is nothing left to do here.
+                let (repacked_weight, repacked_scale) = if prepacked_sm70 {
+                    (weight.clone(), scale.clone())
+                } else {
                     sm70_weight_cache::get_or_repack(
                         &weight,
                         &scale,
@@ -778,8 +807,8 @@ pub fn nvfp4_matmul(
                         weight_row_scales,
                         n,
                         k,
-                    )?;
-
+                    )?
+                };
                 let (input_s, _) = input.storage_and_layout();
                 let (ws, _) = repacked_weight.storage_and_layout();
                 let (wss, _) = repacked_scale.storage_and_layout();
@@ -824,8 +853,13 @@ pub fn nvfp4_matmul(
                 // while a CUDA graph is being captured, and it would also run
                 // once per layer per token.  It therefore only runs on the
                 // very first call and only outside of a graph capture.
+                //
+                // The reference path needs the original packed tensors, so
+                // the check is skipped when the weight arrived already
+                // repacked: there is no packed copy left to compare against.
                 if crate::nvfp4_sm70_check()
                     && !sm70_check_done()
+                    && !prepacked_sm70
                     && !capturing(stream as usize)
                 {
                     check_sm70_vs_software(
@@ -1522,6 +1556,35 @@ pub fn nvfp4_repack_weight_sm70(
         );
     }
     Ok((weight_out, scale_out))
+}
+
+/// Repack the weights for the SM70 NVFP4 path, ahead of the first matmul.
+///
+/// The repacked weight has exactly the same size as the packed NVFP4
+/// weight it replaces -- `n * k / 8` u32 is `n * k / 2` bytes, which is
+/// what `n * k / 2` u8 weighs -- so the caller can drop the original and
+/// keep only the repacked copy.  On a 27B model that is the difference
+/// between holding the weights twice and holding them once.
+///
+/// The repacked scale is stored as u32, so it is twice the size of the
+/// original u8 scale.
+#[cfg(feature = "cuda")]
+pub fn nvfp4_prepack_sm70(
+    weight: &Tensor,
+    scale: &Tensor,
+    weight_global_scale: f32,
+    weight_row_scales: Option<&Tensor>,
+    n: usize,
+    k: usize,
+) -> Result<(Tensor, Tensor)> {
+    nvfp4_repack_weight_sm70(
+        weight,
+        scale,
+        weight_global_scale,
+        weight_row_scales,
+        n,
+        k,
+    )
 }
 
 /// Run the SM70 HMMA.884 NVFP4 GEMM.
