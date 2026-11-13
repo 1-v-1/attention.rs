@@ -451,14 +451,14 @@ __launch_bounds__(SM70_NVFP4_WARP_SIZE * kWarps) __global__
             tp[j] = __ldg(&weight_scale[(size_t)gcol * scale_blocks + ggroup + j]);
       }
       uint32_t *dst = reinterpret_cast<uint32_t *>(sdst + c * (kTileK / 8));
-      // The shared entry index of the first group this thread owns.  The
-      // group index counts 16-element groups, and each group fills two
+      // The group index counts 16-element groups, and each group fills two
       // shared entries (the two weight words of the group).
+      const uint32_t *rawp = reinterpret_cast<const uint32_t *>(&raw);
 #pragma unroll
       for (int j = 0; j < kSVec; ++j) {
         const int g = v * kSVec + j;
         if (g >= groups_per_col) break;
-        const uint32_t hb = raw[j] & 0xFFFFu;
+        const uint32_t hb = rawp[j] & 0xFFFFu;
         dst[g * kSGroups] = hb | (hb << 16);
         dst[g * kSGroups + 1] = hb | (hb << 16);
       }
