@@ -471,8 +471,7 @@ impl FlashInferDecodeWithPlan {
         q: &CudaStorage,
         q_l: &Layout,
     ) -> Result<(CudaStorage, candle::Shape)> {
-        let dev = q.device();
-        let cuda_dev = dev.as_cuda_device()?;
+        let cuda_dev = q.device();
         let (batch_size, _, _) = q_l.shape().dims3()?;
         if self.num_kv_heads == 0 || self.num_qo_heads % self.num_kv_heads != 0 {
             candle::bail!(
@@ -1104,8 +1103,7 @@ impl FlashInferPrefillWithPlan {
         q: &CudaStorage,
         q_l: &Layout,
     ) -> Result<(CudaStorage, candle::Shape)> {
-        let dev = q.device();
-        let cuda_dev = dev.as_cuda_device()?;
+        let cuda_dev = q.device();
         if !is_supported_flashinfer_head_dim(&cuda_dev, self.head_dim) {
             candle::bail!(
                 "flashinfer prefill head_dim={} is not compiled for this device; supported: {:?}",
@@ -1456,8 +1454,7 @@ impl FlashInferRaggedPrefill {
         q: &CudaStorage,
         q_l: &Layout,
     ) -> Result<(CudaStorage, candle::Shape)> {
-        let dev = q.device();
-        let cuda_dev = dev.as_cuda_device()?;
+        let cuda_dev = q.device();
         if self.num_kv_heads == 0 || self.num_qo_heads % self.num_kv_heads != 0 {
             candle::bail!(
                 "invalid flashinfer ragged prefill head config: qo_heads={} kv_heads={}",
