@@ -286,6 +286,29 @@ mod cuda {
         })
     }
 
+    /// Allocate the graph workspace up front, outside of a graph capture.
+    ///
+    /// The decode graph needs a plan workspace of its own, because the
+    /// addresses it hands out have to stay stable across replays.  The
+    /// obvious place to create it is the first call that needs it -- but that
+    /// call happens *inside* the capture, and a buffer that is allocated
+    /// during a capture comes out of the capture's memory pool.  A pool
+    /// allocation cannot be handed back to the driver (the graphs keep
+    /// referring to it), so the buffer would stay resident in the pool for
+    /// the whole lifetime of the process, inflating the pool by the full
+    /// size of the workspace.
+    ///
+    /// Creating it before the capture starts puts it in the device's default
+    /// pool instead, where the allocator is free to reuse or release it.
+    ///
+    /// This is a no-op if the workspace already exists.
+    pub fn preallocate_graph_workspace(
+        dev: &candle_core::cuda_backend::CudaDevice,
+    ) -> Result<()> {
+        get_or_init_workspace(dev, true)?;
+        Ok(())
+    }
+
     /// Returns workspace pointers for FlashInfer plan operations.
     ///
     /// Returns (float_ptr, float_size, int_ptr, int_size, page_locked_ptr, page_locked_size).
