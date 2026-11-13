@@ -47,12 +47,6 @@ use candle_core::cuda_backend::cudarc::driver::{sys, CudaSlice, DevicePtr};
 use candle_core::cuda_backend::WrapErr;
 use candle_core::Result;
 
-/// Total size of the float workspace buffer (512 MiB).
-pub const WORKSPACE_FLOAT_SIZE: usize = 512 * 1024 * 1024;
-
-/// Size of the int workspace buffer (128 MiB).
-pub const WORKSPACE_INT_SIZE: usize = 128 * 1024 * 1024;
-
 /// Size of the FlashInfer plan region within the float buffer.
 pub const FLASHINFER_PLAN_FLOAT_SIZE: usize = 256 * 1024 * 1024;
 
@@ -60,7 +54,26 @@ pub const FLASHINFER_PLAN_FLOAT_SIZE: usize = 256 * 1024 * 1024;
 pub const GEMM_SCRATCH_FLOAT_OFFSET: usize = FLASHINFER_PLAN_FLOAT_SIZE;
 
 /// Size of the GEMM scratch region (used by CUTLASS operations).
+///
+/// The region only exists for the CUTLASS kernels, which are behind their
+/// own feature flag.  Without it the float buffer would be half its size
+/// for nothing: on a 27B model on a 16 GB card that is 512 MiB per card,
+/// which is the difference between a KV cache and none at all.
+#[cfg(feature = "cutlass")]
 pub const GEMM_SCRATCH_FLOAT_SIZE: usize = 256 * 1024 * 1024;
+
+/// The GEMM scratch region is empty without the CUTLASS kernels.
+#[cfg(not(feature = "cutlass"))]
+pub const GEMM_SCRATCH_FLOAT_SIZE: usize = 0;
+
+/// Total size of the float workspace buffer.
+///
+/// The buffer holds the FlashInfer plan region, and the GEMM scratch region
+/// when the CUTLASS kernels are compiled in.
+pub const WORKSPACE_FLOAT_SIZE: usize = FLASHINFER_PLAN_FLOAT_SIZE + GEMM_SCRATCH_FLOAT_SIZE;
+
+/// Size of the int workspace buffer (128 MiB).
+pub const WORKSPACE_INT_SIZE: usize = 128 * 1024 * 1024;
 
 /// Fallback workspace size when flashinfer is disabled.
 #[cfg(feature = "cuda")]
@@ -872,10 +885,17 @@ mod tests {
 
     #[test]
     fn constants_are_consistent() {
-        assert_eq!(WORKSPACE_FLOAT_SIZE, 512 * 1024 * 1024);
         assert_eq!(WORKSPACE_INT_SIZE, 128 * 1024 * 1024);
         assert_eq!(FLASHINFER_PLAN_FLOAT_SIZE, 256 * 1024 * 1024);
-        assert_eq!(GEMM_SCRATCH_FLOAT_SIZE, 256 * 1024 * 1024);
         assert_eq!(GEMM_SCRATCH_FLOAT_OFFSET, FLASHINFER_PLAN_FLOAT_SIZE);
+        assert_eq!(
+            WORKSPACE_FLOAT_SIZE,
+            FLASHINFER_PLAN_FLOAT_SIZE + GEMM_SCRATCH_FLOAT_SIZE
+        );
+        // The GEMM scratch region only exists for the CUTLASS kernels.
+        #[cfg(feature = "cutlass")]
+        assert_eq!(GEMM_SCRATCH_FLOAT_SIZE, 256 * 1024 * 1024);
+        #[cfg(not(feature = "cutlass"))]
+        assert_eq!(GEMM_SCRATCH_FLOAT_SIZE, 0);
     }
 }
