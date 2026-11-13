@@ -345,6 +345,13 @@ __device__ __forceinline__ float hw_dot_16(uint2 packed, float scale,
 #ifndef NVFP4_DECODE_BLOCK_ROWS_BATCH
 #define NVFP4_DECODE_BLOCK_ROWS_BATCH 16
 #endif
+// Whether a warp of the batched decode path covers two output columns
+// instead of one.  Two columns double the work a warp has to retire, and
+// on Volta the block then needs 64 registers per thread, so the setting has
+// to be measured rather than assumed.
+#ifndef NVFP4_DECODE_DUAL_ROW
+#define NVFP4_DECODE_DUAL_ROW 1
+#endif
 constexpr int BLOCK_N_SM = NVFP4_DECODE_BLOCK_ROWS;
 
 template <typename T, int ROWS, bool DUAL_ROW>
@@ -1045,23 +1052,42 @@ __launch_bounds__(MOE_BLOCK_N *WARP_SIZE) __global__
 #ifndef NVFP4_WMMA_BN
 #define NVFP4_WMMA_BN 64
 #endif
-#define WMMA_BK 16
-
+// The k extent staged per iteration.  The tensor core fragment is 16 wide, so
+// a larger extent means several fragments per iteration, which gives the
+// loader more independent requests in flight.
+#ifndef NVFP4_WMMA_BK
+#define NVFP4_WMMA_BK 16
+#endif
+static_assert(NVFP4_WMMA_BK % 16 == 0,
+              "the wmma fragment is 16 k columns wide, so the staging extent "
+              "has to be a multiple of 16");
 // Shared-memory layout of the wmma path.  The staging area and the output
 // area overlap: the output is produced after the k loop, so it can reuse the
 // staging space.  On Volta the shared-memory budget decides how many blocks
 // stay resident per SM, and the output buffer alone was three quarters of
 // the footprint.
-template <typename T, int BM, int BN>
+// Number of output rows that pass through shared memory in one batch.  A wmma
+// fragment is sixteen rows tall, so a batch holds whole fragments.
+#ifndef NVFP4_WMMA_OUT_ROWS
+#define NVFP4_WMMA_OUT_ROWS 16
+#endif
+
+// Rows of the output that are staged in shared memory at a time.  The wmma
+// accumulator cannot be written straight to global memory, so the result has
+// to pass through shared memory.  Staging the whole BM x BN tile at once cost
+// 34.8 KB on Volta and pinned the occupancy at two blocks per SM; staging one
+// sixteen-row band at a time keeps the footprint small enough for the SM to
+// hold many blocks.
+template <typename T, int BM, int BN, int BK>
 union WmmaSmem {
   struct {
-    T a[BM][WMMA_BK + 8];
-    T b[BN][WMMA_BK + 8];
+    T a[BM][BK + 8];
+    T b[BN][BK + 8];
   } work;
-  float out[BM][BN + 4];
+  float out[NVFP4_WMMA_OUT_ROWS][BN + 4];
 };
 
-template <typename T, int BM, int BN>
+template <typename T, int BM, int BN, int BK>
 __global__ void nvfp4_wmma_matmul_kernel(
     const T *__restrict__ input,
     const uint8_t *__restrict__ weight,
@@ -1115,12 +1141,12 @@ __global__ void nvfp4_wmma_matmul_kernel(
   // blocks stay resident per SM, and the output buffer alone was three
   // quarters of the footprint.
   extern __shared__ char wmma_smem_raw[];
-  WmmaSmem<T, BM, BN> &wmma_smem =
-      *reinterpret_cast<WmmaSmem<T, BM, BN> *>(wmma_smem_raw);
-  T (&s_a)[BM][WMMA_BK + 8] = wmma_smem.work.a;
-  T (&s_b)[BN][WMMA_BK + 8] = wmma_smem.work.b;
+  WmmaSmem<T, BM, BN, BK> &wmma_smem =
+      *reinterpret_cast<WmmaSmem<T, BM, BN, BK> *>(wmma_smem_raw);
+  T (&s_a)[BM][BK + 8] = wmma_smem.work.a;
+  T (&s_b)[BN][BK + 8] = wmma_smem.work.b;
 
-  for (int k_step = 0; k_step < K; k_step += WMMA_BK) {
+  for (int k_step = 0; k_step < K; k_step += BK) {
 
     // Store two halves at a time: the row stride is 24 half (48 bytes), so
     // single-half stores make consecutive threads hit the same shared-memory
@@ -1134,9 +1160,9 @@ __global__ void nvfp4_wmma_matmul_kernel(
     constexpr int ELEMS_PER_VEC = 8; // 8 halves = 16 bytes = 128 bits
     const int K_vec = K / ELEMS_PER_VEC;
     const float4 *in_vec = reinterpret_cast<const float4 *>(input);
-    for (int i = tid; i < BM * (WMMA_BK / ELEMS_PER_VEC); i += 128) {
-      const int r = i / (WMMA_BK / ELEMS_PER_VEC);
-      const int c = (i % (WMMA_BK / ELEMS_PER_VEC)) * ELEMS_PER_VEC;
+    for (int i = tid; i < BM * (BK / ELEMS_PER_VEC); i += 128) {
+      const int r = i / (BK / ELEMS_PER_VEC);
+      const int c = (i % (BK / ELEMS_PER_VEC)) * ELEMS_PER_VEC;
       const int gr = by * BM + r;
       const int gc = k_step + c;
       float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -1155,12 +1181,20 @@ __global__ void nvfp4_wmma_matmul_kernel(
         s_a[r][c + j] = elems[j];
     }
 
-    // One warp per two rows of the tile: the 32 lanes split into 16 rows
-    // times the two halves of the packed weight word.  When the tile is
-    // wider than 64 rows the loop walks the extra rows as well, otherwise
-    // half of s_b would be left uninitialized.
-    for (int row = tid / 2; row < BN; row += blockDim.x / 2) {
-      int sub = tid & 1;
+    // The packed weight holds two values per byte, so one 16-bit word covers
+    // eight k columns.  A staging extent of BK columns therefore needs
+    // BK / 16 words per row, and two threads share a word because the
+    // word holds sixteen columns.  Every thread therefore covers one half of
+    // one word of one row, and the block covers the rows and the words of a
+    // row without overlap.  With a staging extent of a single word the block
+    // covers BN rows in one pass; a wider extent needs more passes, and the
+    // loop below walks them.
+    constexpr int WORDS_PER_ROW = BK / 16;
+    constexpr int THREADS_PER_ROW = WORDS_PER_ROW * 2;
+    for (int idx = tid; idx < BN * THREADS_PER_ROW; idx += blockDim.x) {
+      const int row = idx / THREADS_PER_ROW;
+      const int word_idx = (idx % THREADS_PER_ROW) / 2;
+      const int sub = idx & 1;
       int gn = bx * BN + row;
 
       if (row < BN && gn < N && k_step < K) {
@@ -1168,17 +1202,18 @@ __global__ void nvfp4_wmma_matmul_kernel(
             ? weight_row_scales[gn]
             : weight_global_scale;
         float raw_scale = fp8_scale_to_float(
-            __ldg(&weight_scale[(size_t)gn * scale_stride + k_step / NVFP4_BLOCK_SIZE]))
+            __ldg(&weight_scale[(size_t)gn * scale_stride +
+                                (k_step + word_idx * 16) / NVFP4_BLOCK_SIZE]))
             * row_gscale;
 
         // The weights are streamed once per tile, so they are loaded with
         // the streaming hint and do not evict the activation rows that every
         // block shares.
         uint2 w_vec = load_uint2_stream(
-            &weight[(size_t)gn * half_k + k_step / 2]);
+            &weight[(size_t)gn * half_k + k_step / 2 + word_idx * 8]);
 
         uint32_t word = sub ? w_vec.y : w_vec.x;
-        int col_base = sub * 8;
+        int col_base = word_idx * 16 + sub * 8;
 #ifdef NVFP4_HW_DEQUANT
         if (!force_lut) {
 #pragma unroll
@@ -1220,7 +1255,7 @@ __global__ void nvfp4_wmma_matmul_kernel(
           }
         }
       } else if (row < BN) {
-        int col_base = sub * 8;
+        int col_base = word_idx * 16 + sub * 8;
         #pragma unroll
         for (int j = 0; j < 8; j++)
           s_b[row][col_base + j] = T(0);
@@ -1238,43 +1273,83 @@ __global__ void nvfp4_wmma_matmul_kernel(
     for (int fi = 0; fi < BM / 32; fi++) {
       #pragma unroll
       for (int fj = 0; fj < BN / 32; fj++) {
-        load_matrix_sync(a_frag, &s_a[warp_row + fi * 16][0], WMMA_BK + 8);
-        load_matrix_sync(b_frag, &s_b[warp_col + fj * 16][0], WMMA_BK + 8);
-        mma_sync(acc[fi][fj], a_frag, b_frag, acc[fi][fj]);
+        // One fragment per 16-wide k step; the staging area holds BK
+        // columns, so a larger extent runs several of them back to back.
+        #pragma unroll
+        for (int kk = 0; kk < (BK / 16); kk++) {
+          // The leading dimension is the row stride of the staging area; the
+          // fragment itself is 16 wide, so a wider extent only moves the
+          // start of the segment.
+          load_matrix_sync(a_frag, &s_a[warp_row + fi * 16][kk * 16],
+                           BK + 8);
+          load_matrix_sync(b_frag, &s_b[warp_col + fj * 16][kk * 16],
+                           BK + 8);
+          mma_sync(acc[fi][fj], a_frag, b_frag, acc[fi][fj]);
+        }
       }
     }
     __syncthreads();
   }
 
   // --- Store output: from accumulators through shared memory ---
-  float (&s_out)[BM][BN + 4] = wmma_smem.out;
+  //
+  // The accumulator lives in registers and wmma cannot write it straight to
+  // global memory, so it passes through shared memory.  Only one band of
+  // sixteen rows is staged at a time: the warps of the band store their
+  // fragments, the whole block writes the band out, and the next band
+  // follows.  The bands are a handful of barriers against the hundreds of
+  // tensor-core steps of the k loop, and the shared-memory saving is what
+  // lets several blocks stay resident on a SM.
+  float (&s_out)[NVFP4_WMMA_OUT_ROWS][BN + 4] = wmma_smem.out;
 
-  #pragma unroll
-  for (int fi = 0; fi < BM / 32; fi++)
-    #pragma unroll
-    for (int fj = 0; fj < BN / 32; fj++)
-      store_matrix_sync(&s_out[warp_row + fi * 16][warp_col + fj * 16],
-                        acc[fi][fj], BN + 4, mem_row_major);
-  __syncthreads();
+  // The four warps form a 2x2 grid over the tile, so the band index splits
+  // into the row group (which half of the tile the warp owns) and the
+  // fragment index inside that half.
+  constexpr int kRowGroups = 2;
+  constexpr int kFragsPerGroup = BM / 32;
+  constexpr int kRowsPerBand = NVFP4_WMMA_OUT_ROWS;
+  constexpr int kBands = kRowGroups * kFragsPerGroup;
+  static_assert(NVFP4_WMMA_OUT_ROWS == 16,
+                "a band holds exactly one wmma fragment row");
+  static_assert(kBands * kRowsPerBand == BM,
+                "the bands have to cover the whole tile");
 
-  for (int i = tid; i < BM * BN; i += 128) {
-    int r = i / BN;
-    int c = i % BN;
-    int gr = by * BM + r;
-    int gc = bx * BN + c;
-    if (gr < M && gc < N) {
-      float val = s_out[r][c];
-      if (has_bias && bias != nullptr) {
-        if constexpr (std::is_same_v<T, __half>)
-          val += __half2float(__ldg(&bias[gc]));
-        else
-          val += __bfloat162float(__ldg(&bias[gc]));
-      }
-      if constexpr (std::is_same_v<T, __half>)
-        output[(size_t)gr * N + gc] = __float2half(val);
-      else
-        output[(size_t)gr * N + gc] = __float2bfloat16_rn(val);
+  for (int band = 0; band < kBands; ++band) {
+    const int group = band / kFragsPerGroup;
+    const int frag = band % kFragsPerGroup;
+    const int band_row = group * (BM / 2) + frag * 16;
+
+    // Only the warps that own the band take part in the store.  The others
+    // wait at the barrier below.
+    if (warp_row == group * (BM / 2)) {
+      #pragma unroll
+      for (int fj = 0; fj < BN / 32; fj++)
+        store_matrix_sync(&s_out[0][warp_col + fj * 16], acc[frag][fj], BN + 4,
+                          mem_row_major);
     }
+    __syncthreads();
+
+    for (int i = tid; i < kRowsPerBand * BN; i += 128) {
+      int r = i / BN;
+      int c = i % BN;
+      int gr = by * BM + band_row + r;
+      int gc = bx * BN + c;
+      if (gr < M && gc < N) {
+        float val = s_out[r][c];
+        if (has_bias && bias != nullptr) {
+          if constexpr (std::is_same_v<T, __half>)
+            val += __half2float(__ldg(&bias[gc]));
+          else
+            val += __bfloat162float(__ldg(&bias[gc]));
+        }
+        if constexpr (std::is_same_v<T, __half>)
+          output[(size_t)gr * N + gc] = __float2half(val);
+        else
+          output[(size_t)gr * N + gc] = __float2bfloat16_rn(val);
+      }
+    }
+    // The next band reuses the same shared buffer.
+    __syncthreads();
   }
 }
 
@@ -1312,9 +1387,11 @@ static void launch_nvfp4_smallm(const T *input, const uint8_t *weight,
   } else {
     // A wider batch can afford two rows per warp: the loads of one row
     // overlap with the arithmetic of the other.
-    auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<T, kBatch, true>;
+    constexpr bool kDual = NVFP4_DECODE_DUAL_ROW != 0;
+    constexpr int kColumns = kDual ? 2 * kBatch : kBatch;
+    auto kernel = nvfp4_gemm::nvfp4_matmul_smallm_kernel<T, kBatch, kDual>;
     dim3 block(kBatch * WARP_SIZE);
-    dim3 grid(CEILDIV(N, 2 * kBatch), M);
+    dim3 grid(CEILDIV(N, kColumns), M);
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)smem);
     kernel<<<grid, block, smem, stream>>>(
@@ -1358,6 +1435,29 @@ extern "C" void nvfp4_matmul_smallm_bf16(const void *, const uint8_t *,
                                           cudaStream_t) {}
 #endif
 
+// Launch the wmma path with a given tile shape.
+template <int BM, int BN, int BK>
+static void launch_nvfp4_wmma(const __half *input, const uint8_t *weight,
+                              const uint8_t *weight_scale,
+                              float weight_global_scale,
+                              const float *weight_row_scales,
+                              const __half *bias, __half *output, int M, int N,
+                              int K, bool has_bias, bool force_lut,
+                              cudaStream_t stream) {
+  dim3 block(128);
+  dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
+  // The kernel shares one buffer between the staging area and the output
+  // area, so the allocation is the larger of the two.
+  constexpr size_t kSmem = sizeof(nvfp4_gemm::WmmaSmem<half, BM, BN, BK>);
+  auto kernel = nvfp4_gemm::nvfp4_wmma_matmul_kernel<half, BM, BN, BK>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       (int)kSmem);
+  kernel<<<grid, block, kSmem, stream>>>(input, weight, weight_scale,
+                                         weight_global_scale, weight_row_scales,
+                                         bias, output, M, N, K,
+                                         has_bias, force_lut);
+}
+
 extern "C" void nvfp4_matmul_f16(const __half *input, const uint8_t *weight,
                                   const uint8_t *weight_scale,
                                   float weight_global_scale,
@@ -1370,19 +1470,52 @@ extern "C" void nvfp4_matmul_f16(const __half *input, const uint8_t *weight,
   // has no BF16 tensor cores, so it must not disable the F16 variant: doing
   // so pushed SM70 onto the fp32 tiled fallback, which is an order of
   // magnitude slower.
-  constexpr int BM = NVFP4_WMMA_BM, BN = NVFP4_WMMA_BN;
-  dim3 block(128);
-  dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
-  // The kernel shares one buffer between the staging area and the output
-  // area, so the allocation is the larger of the two.
-  constexpr size_t kSmem = sizeof(nvfp4_gemm::WmmaSmem<half, BM, BN>);
-  auto kernel = nvfp4_gemm::nvfp4_wmma_matmul_kernel<half, BM, BN>;
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       (int)kSmem);
-  kernel<<<grid, block, kSmem, stream>>>(input, weight, weight_scale,
-                                         weight_global_scale, weight_row_scales,
-                                         bias, output, M, N, K,
-                                         has_bias, force_lut);
+  //
+  // The tile shape is picked from the row count.  A short prompt wants a tall
+  // tile: when the tile covers every row, the grid has a single row of
+  // blocks and the weights are read once instead of once per row of tiles.
+  // A long prompt already reads the weights many times, so there the traffic
+  // is what matters and a wide, short tile wins.
+  //
+  // Measured on a V100 (sm_70), the median of five nsys profiles, with
+  // N=8704 and K=5120:
+  //
+  //   tile        64x64     128x64
+  //   128 rows   1049 us    (BN=128: 961 us)
+  //  4096 rows   (BM=64)  21538 us   (BM=64, BN=128: 25518 us)
+  //
+  // A short prompt needs the smaller M tile: a tall one leaves too few
+  // blocks to fill the device.  A long prompt does the opposite, because
+  // there the weight traffic is what the shape controls.
+  //
+  // The wider N tile only pays off together with a deeper K staging
+  // extent: at K=16 a 128 wide tile is slower than a 64 wide one, and at
+  // K=32 it is faster.  The reason is the per-iteration barrier, which a
+  // deeper K extent amortises.
+#ifdef NVFP4_WMMA_BM_OVERRIDE
+  // A fixed tile was requested from the environment; use it for every size.
+  launch_nvfp4_wmma<NVFP4_WMMA_BM_OVERRIDE, NVFP4_WMMA_BN_OVERRIDE,
+                   NVFP4_WMMA_BK>(
+      input, weight, weight_scale, weight_global_scale, weight_row_scales,
+      bias, output, M, N, K, has_bias, force_lut, stream);
+#else
+  if (M <= 256) {
+    // A wide tile spreads the activation load over more output columns, but
+    // it needs a deeper staging extent to pay for the extra shared memory.
+    launch_nvfp4_wmma<64, 128, 32>(input, weight, weight_scale,
+                                   weight_global_scale, weight_row_scales, bias,
+                                   output, M, N, K, has_bias, force_lut,
+                                   stream);
+  } else {
+    // A tall tile keeps the shared memory small, which is what a long
+    // prompt needs: there the weight traffic, not the activation, decides
+    // the time.
+    launch_nvfp4_wmma<128, 64, 16>(input, weight, weight_scale,
+                                    weight_global_scale, weight_row_scales, bias,
+                                    output, M, N, K, has_bias, force_lut,
+                                    stream);
+  }
+#endif
 }
 
 #ifndef NO_BF16_KERNEL
@@ -1395,10 +1528,10 @@ extern "C" void nvfp4_matmul_bf16(const __nv_bfloat16 *input,
                                    __nv_bfloat16 *output, int M, int N, int K,
                                    bool has_bias, bool force_lut,
                                    cudaStream_t stream) {
-  constexpr int BM = 64, BN = 64;
+  constexpr int BM = 64, BN = 64, BK = 16;
   dim3 block(128);
   dim3 grid(CEILDIV(N, BN), CEILDIV(M, BM));
-  nvfp4_gemm::nvfp4_wmma_matmul_kernel<__nv_bfloat16, BM, BN>
+  nvfp4_gemm::nvfp4_wmma_matmul_kernel<__nv_bfloat16, BM, BN, BK>
       <<<grid, block, 0, stream>>>(input, weight, weight_scale,
                                    weight_global_scale, weight_row_scales,
                                    bias, output, M, N, K,

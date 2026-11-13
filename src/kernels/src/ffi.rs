@@ -3078,6 +3078,41 @@ extern "C" {
         stream: i64,
     );
 
+    /// Repack NVFP4 weights for the SM70 HMMA.884 path.
+    ///
+    /// `weight` is `[N, K/2]` bytes with two nibbles per byte (low nibble
+    /// first), `weight_scale` is `[N, K/16]` FP8 E4M3 bytes.  The outputs are
+    /// `[N, K/8]` uint32 words holding eight contiguous k of one column, and
+    /// `[N, K/8]` uint32 holding the E4M3 scale converted to half in both
+    /// halves.
+    pub fn nvfp4_repack_weight_sm70(
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_out: *mut u32,
+        scale_out: *mut u32,
+        column_global_scale: *const f32,
+        global_scale: f32,
+        n: c_int,
+        k: c_int,
+        stream: i64,
+    );
+
+    /// SM70 (Volta) HMMA.884 NVFP4 GEMM.
+    pub fn nvfp4_matmul_hmma884_f16(
+        input: *const c_void,
+        weight: *const u32,
+        weight_scale: *const u32,
+        weight_global_scale: f32,
+        weight_row_scales: *const f32,
+        bias: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        has_bias: bool,
+        stream: i64,
+    );
+
     pub fn nvfp4_indexed_moe_gemm_f16(
         input: *const c_void,
         weights: *const u8,

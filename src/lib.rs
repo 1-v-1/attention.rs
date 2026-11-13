@@ -206,6 +206,7 @@ where
 pub mod trtllm_cubin_loader;
 
 static NVFP4_FORCE_LUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static NVFP4_SM70_CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static NVFP4_ONLINE_SCALE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static NVFP4_HW_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
@@ -228,6 +229,16 @@ fn env_flag_enabled_or(name: &str, default: bool) -> bool {
 /// instead of hardware FP4 intrinsics on Blackwell (SM100+).
 pub fn nvfp4_force_lut() -> bool {
     *NVFP4_FORCE_LUT.get_or_init(|| env_flag_enabled("XINFER_NVFP4_FORCE_LUT"))
+}
+
+/// Returns true if `XINFER_NVFP4_SM70_CHECK=1` is set.
+///
+/// When enabled, the SM70 (Volta) HMMA.884 NVFP4 path additionally runs the
+/// generic software dequantization GEMM and reports the maximum absolute
+/// difference between the two results.  It roughly doubles the cost of every
+/// NVFP4 GEMM, so it is only meant for validation runs.
+pub fn nvfp4_sm70_check() -> bool {
+    *NVFP4_SM70_CHECK.get_or_init(|| env_flag_enabled("XINFER_NVFP4_SM70_CHECK"))
 }
 
 /// Returns true if `XINFER_NVFP4_ONLINE_SCALE=1` is set.

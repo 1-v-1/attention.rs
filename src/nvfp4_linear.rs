@@ -276,6 +276,129 @@ pub fn swizzle_nvfp4_weight_scales(scale: &Tensor) -> Result<Tensor> {
 /// Like [`nvfp4_matmul`] but accepts optional pre-swizzled weight scales to
 /// avoid redundant per-call swizzling on the hardware FP4 path.
 #[allow(unused)]
+// ---------------------------------------------------------------------------
+// SM70 (Volta) HMMA.884 weight cache.
+//
+// The Volta path needs the weights repacked into `[N, K/8]` uint32 (eight
+// contiguous k of one output column per word) and the block scales converted
+// to a half duplicated in both halves.  That repack is expensive relative to
+// a decode step, so it is done once per layer and cached.
+//
+// The cache is keyed by the device pointer of the source weight tensor, which
+// is stable for the lifetime of a loaded model.  It only holds a handful of
+// entries (one per NVFP4 linear layer), so a linear scan is fine.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+mod sm70_weight_cache {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+    use candle_core::{DType, Result, Tensor};
+
+    pub struct Entry {
+        pub weight: Tensor,
+        pub scale: Tensor,
+    }
+
+    /// The key combines the weight's device pointer with the global scale,
+    /// because the global scale is folded into the repacked block scales and
+    /// therefore changes the result.
+    type Key = (u64, u64, u32);
+
+    type Cache = HashMap<Key, Entry>;
+
+    fn cache() -> &'static Mutex<Cache> {
+        static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Return the repacked weights for `weight`, repacking on first use.
+    ///
+    /// `weight` is the `[N, K/2]` u8 checkpoint tensor and `scale` is the
+    /// `[N, K/16]` u8 FP8 E4M3 block scale tensor.
+    pub fn get_or_repack(
+        weight: &Tensor,
+        scale: &Tensor,
+        weight_global_scale: f32,
+        column_global_scale: Option<&Tensor>,
+        n: usize,
+        k: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        use candle_core::Storage;
+
+        let (ws, _) = weight.storage_and_layout();
+        let weight_key = match &*ws {
+            Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr(),
+            _ => candle_core::bail!("weight must be on CUDA"),
+        };
+
+        // The per-column global scale is folded into the repacked block
+        // scales as well, so its identity has to be part of the key.
+        let column_key = match column_global_scale {
+            Some(cs) => {
+                let (cs_s, _) = cs.storage_and_layout();
+                match &*cs_s {
+                    Storage::Cuda(c) => *c.as_cuda_slice::<f32>()?.device_ptr(),
+                    _ => candle_core::bail!("column_global_scale must be on CUDA"),
+                }
+            }
+            None => 0,
+        };
+
+        let key = (weight_key, column_key, weight_global_scale.to_bits());
+
+        {
+            let guard = cache().lock().unwrap();
+            if let Some(entry) = guard.get(&key) {
+                return Ok((entry.weight.clone(), entry.scale.clone()));
+            }
+        }
+
+        let (repacked_weight, repacked_scale) =
+            crate::nvfp4_linear::nvfp4_repack_weight_sm70(
+                weight,
+                scale,
+                weight_global_scale,
+                column_global_scale,
+                n,
+                k,
+            )?;
+
+        let mut guard = cache().lock().unwrap();
+        guard.insert(
+            key,
+            Entry {
+                weight: repacked_weight.clone(),
+                scale: repacked_scale.clone(),
+            },
+        );
+        Ok((repacked_weight, repacked_scale))
+    }
+}
+
+/// Whether the SM70 HMMA.884 path should be used on this device.
+///
+/// Volta (SM70) has no `m16n16k16` HMMA and no hardware FP4, so the generic
+/// path falls back to the LUT-based software dequant, which leaves the tensor
+/// cores idle.  The HMMA.884 kernel uses the Volta `m8n8k4` instruction
+/// instead and is several times faster on the decode shape.
+#[cfg(feature = "cuda")]
+fn use_sm70_hmma884(cuda_dev: &candle_core::CudaDevice) -> bool {
+    // XINFER_NVFP4_SM70_HMMA884=0 forces the generic software path, which
+    // makes it possible to A/B the Volta kernel against the fallback on the
+    // same model without rebuilding.
+    if std::env::var("XINFER_NVFP4_SM70_HMMA884")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    crate::cuda_utils::sm_version(cuda_dev) == Some(70)
+}
+
 pub fn nvfp4_matmul(
     input: &Tensor,
     weight: &Tensor,
@@ -333,19 +456,7 @@ pub fn nvfp4_matmul(
         #[cfg(feature = "cuda")]
         candle_core::Device::Cuda(cuda_dev) => {
             use candle_core::Storage;
-
-            fn cuda_ptr(s: &Storage, dtype: DType) -> candle_core::Result<u64> {
-                match s {
-                    Storage::Cuda(c) => match dtype {
-                        DType::F16 => Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr()),
-                        DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
-                        DType::U8 | DType::F8E4M3 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
-                        DType::F32 => Ok(*c.as_cuda_slice::<f32>()?.device_ptr()),
-                        _ => candle_core::bail!("unsupported dtype {:?}", dtype),
-                    },
-                    _ => candle_core::bail!("tensor must be on CUDA"),
-                }
-            }
+            let _ = &Storage::Cuda;
 
             // Hardware W4A4 for prefill; decode too unless XINFER_NVFP4_HW_DECODE=0.
             let sm = crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0);
@@ -651,6 +762,86 @@ pub fn nvfp4_matmul(
                     let _ = (use_flashinfer_fp4, use_hardware_fp4, use_flashinfer_quant);
                     candle_core::bail!("nvfp4 hardware path requires the cutlass feature");
                 }
+            } else if use_sm70_hmma884(cuda_dev)
+                && dtype == DType::F16
+                && k % 16 == 0
+                && weight_scale_swizzled.is_none()
+            {
+                // SM70 (Volta) HMMA.884 path: the weights are repacked once
+                // per layer and cached, then every step runs on the tensor
+                // cores with `mma.m8n8k4`.
+                let (repacked_weight, repacked_scale) =
+                    sm70_weight_cache::get_or_repack(
+                        &weight,
+                        &scale,
+                        weight_global_scale,
+                        weight_row_scales,
+                        n,
+                        k,
+                    )?;
+
+                let (input_s, _) = input.storage_and_layout();
+                let (ws, _) = repacked_weight.storage_and_layout();
+                let (wss, _) = repacked_scale.storage_and_layout();
+                let (output_s, _) = output.storage_and_layout();
+
+                let input_ptr = cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;
+                let weight_ptr = cuda_ptr(&ws, DType::U32)? as *const u32;
+                let scale_ptr = cuda_ptr(&wss, DType::U32)? as *const u32;
+                let output_ptr = cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void;
+
+                let bias_ptr = if let Some(b) = bias {
+                    let (b_s, _) = b.storage_and_layout();
+                    cuda_ptr(&b_s, b.dtype())? as *const std::ffi::c_void
+                } else {
+                    std::ptr::null()
+                };
+
+                let stream = *cuda_dev.cu_stream() as i64;
+
+                unsafe {
+                    ffi::nvfp4_matmul_hmma884_f16(
+                        input_ptr,
+                        weight_ptr,
+                        scale_ptr,
+                        weight_global_scale,
+                        std::ptr::null(),
+                        bias_ptr,
+                        output_ptr,
+                        m as i32,
+                        n as i32,
+                        k as i32,
+                        has_bias,
+                        stream,
+                    );
+                }
+
+                // Optional cross-check against the generic software dequant
+                // path.  Enabled with XINFER_NVFP4_SM70_CHECK=1; it doubles the
+                // work of every GEMM, so it is only meant for validation runs.
+                //
+                // The check copies results back to the host, which is illegal
+                // while a CUDA graph is being captured, and it would also run
+                // once per layer per token.  It therefore only runs on the
+                // very first call and only outside of a graph capture.
+                if crate::nvfp4_sm70_check()
+                    && !sm70_check_done()
+                    && !capturing(stream as usize)
+                {
+                    check_sm70_vs_software(
+                        &input,
+                        &weight,
+                        &scale,
+                        weight_global_scale,
+                        weight_row_scales,
+                        bias,
+                        &output,
+                        m,
+                        n,
+                        k,
+                    )?;
+                    set_sm70_check_done();
+                }
             } else {
                 // Software dequant path (existing kernels)
                 let (input_s, _) = input.storage_and_layout();
@@ -876,6 +1067,207 @@ pub fn nvfp4_matmul(
     }
 }
 
+/// Device pointer of a CUDA tensor, addressed as the raw element type that
+/// matches `dtype`.
+///
+/// The SM70 HMMA.884 path keeps the repacked weights and the block scales in
+/// u32 tensors, which is why `DType::U32` is supported here.
+#[cfg(feature = "cuda")]
+fn cuda_ptr(s: &candle_core::Storage, dtype: DType) -> candle_core::Result<u64> {
+    use candle_core::Storage;
+    match s {
+        Storage::Cuda(c) => match dtype {
+            DType::F16 => Ok(*c.as_cuda_slice::<half::f16>()?.device_ptr()),
+            DType::BF16 => Ok(*c.as_cuda_slice::<half::bf16>()?.device_ptr()),
+            DType::U8 | DType::F8E4M3 => Ok(*c.as_cuda_slice::<u8>()?.device_ptr()),
+            DType::U32 => Ok(*c.as_cuda_slice::<u32>()?.device_ptr()),
+            DType::F32 => Ok(*c.as_cuda_slice::<f32>()?.device_ptr()),
+            _ => candle_core::bail!("unsupported dtype {:?}", dtype),
+        },
+        _ => candle_core::bail!("tensor must be on CUDA"),
+    }
+}
+
+/// True once the SM70 cross-check has run at least once.  The check copies
+/// GPU results back to the host, so it must not run while a CUDA graph is
+/// being captured.
+#[cfg(feature = "cuda")]
+fn sm70_check_done() -> bool {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    DONE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Marks the SM70 cross-check as done.
+#[cfg(feature = "cuda")]
+fn set_sm70_check_done() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True when the given stream is capturing a CUDA graph.
+///
+/// The runner captures the model into a CUDA graph before the first token,
+/// and the cross-check copies results back to the host, which is illegal
+/// during a capture.  The capture state is queried through the driver API
+/// because the runtime API is not linked into this crate.
+#[cfg(feature = "cuda")]
+fn capturing(stream: usize) -> bool {
+    use candle_core::cuda_backend::cudarc::driver::safe::capture_status;
+    use candle_core::cuda_backend::cudarc::driver::sys::CUstreamCaptureStatus;
+
+    match capture_status(stream as _) {
+        Ok(CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE) => false,
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+/// Cross-check the SM70 HMMA.884 NVFP4 GEMM against the generic software
+/// dequantization path on the very same inputs.
+///
+/// The SM70 path consumes the *repacked* weights (u32 packed nibbles plus the
+/// block scales with the global scale already folded in), while the software
+/// path consumes the raw `[N, K/2]` u8 weights and the original E4M3 scales.
+/// Both are given the same global scale, so the two results must agree
+/// bit-for-bit up to floating point rounding.
+///
+/// Only the F16 decode shape is exercised; anything else is skipped with a
+/// message rather than treated as a failure.
+#[cfg(feature = "cuda")]
+fn check_sm70_vs_software(
+    input: &Tensor,
+    weight: &Tensor,
+    scale: &Tensor,
+    weight_global_scale: f32,
+    weight_row_scales: Option<&Tensor>,
+    bias: Option<&Tensor>,
+    output: &Tensor,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> candle_core::Result<()> {
+    use candle_core::Storage;
+
+    let dtype = input.dtype();
+    if dtype != DType::F16 {
+        return Ok(());
+    }
+
+    let dev = input.device();
+    let ref_out = Tensor::zeros((m, n), dtype, dev)?;
+
+    let (input_s, _) = input.storage_and_layout();
+    let (weight_s, _) = weight.storage_and_layout();
+    let (scale_s, _) = scale.storage_and_layout();
+    let (ref_out_s, _) = ref_out.storage_and_layout();
+
+    let input_ptr = cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;
+    let weight_ptr = cuda_ptr(&weight_s, weight.dtype())? as *const u8;
+    let scale_ptr = cuda_ptr(&scale_s, scale.dtype())? as *const u8;
+    let ref_out_ptr = cuda_ptr(&ref_out_s, dtype)? as *mut std::ffi::c_void;
+
+    let bias_ptr = match bias {
+        Some(b) => {
+            let (b_s, _) = b.storage_and_layout();
+            cuda_ptr(&b_s, b.dtype())? as *const std::ffi::c_void
+        }
+        None => std::ptr::null(),
+    };
+    let row_scales_ptr: *const f32 = match weight_row_scales {
+        Some(rs) => {
+            let (rs_s, _) = rs.storage_and_layout();
+            cuda_ptr(&rs_s, rs.dtype())? as *const f32
+        }
+        None => std::ptr::null(),
+    };
+
+    let cuda_dev = dev.as_cuda_device()?;
+    let stream = *cuda_dev.cu_stream() as i64;
+    let force_lut = crate::nvfp4_force_lut();
+
+    unsafe {
+        if m < 32 {
+            ffi::nvfp4_matmul_smallm_f16(
+                input_ptr,
+                weight_ptr,
+                scale_ptr,
+                weight_global_scale,
+                row_scales_ptr,
+                bias_ptr,
+                ref_out_ptr,
+                m as i32,
+                n as i32,
+                k as i32,
+                bias.is_some(),
+                force_lut,
+                stream,
+            );
+        } else {
+            ffi::nvfp4_matmul_f16(
+                input_ptr,
+                weight_ptr,
+                scale_ptr,
+                weight_global_scale,
+                row_scales_ptr,
+                bias_ptr,
+                ref_out_ptr,
+                m as i32,
+                n as i32,
+                k as i32,
+                bias.is_some(),
+                force_lut,
+                stream,
+            );
+        }
+    }
+
+    // Compare on the host: the two tensors are small (m <= 32 rows).
+    let cpu = candle_core::Device::Cpu;
+    let got = output.to_dtype(DType::F32)?.to_device(&cpu)?;
+    let want = ref_out.to_dtype(DType::F32)?.to_device(&cpu)?;
+    let got_v: Vec<f32> = got.flatten_all()?.to_vec1()?;
+    let want_v: Vec<f32> = want.flatten_all()?.to_vec1()?;
+
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    let mut mismatched = 0usize;
+    for (g, w) in got_v.iter().zip(want_v.iter()) {
+        let d = (g - w).abs();
+        if d > max_abs {
+            max_abs = d;
+        }
+        let scale = w.abs().max(1e-6);
+        let r = d / scale;
+        if r > max_rel {
+            max_rel = r;
+        }
+        if d > 1e-3 {
+            mismatched += 1;
+        }
+    }
+    // Print a few reference values so a scale mismatch is visible directly.
+    let sample: Vec<String> = (0..3)
+        .map(|i| {
+            format!("got={:.6} want={:.6}", got_v[i], want_v[i])
+        })
+        .collect();
+    let row_scale_sample = match weight_row_scales {
+        Some(rs) => {
+            let v = rs.to_dtype(DType::F32)?.to_device(&cpu)?;
+            let sv: Vec<f32> = v.flatten_all()?.to_vec1()?;
+            format!("row_scale[0]={:.8} row_scale[1]={:.8}", sv[0], sv[1])
+        }
+        None => "row_scale=None".to_string(),
+    };
+    eprintln!(
+        "[sm70-check] M={} N={} K={} gscale={} rows_scales={} {} max_abs_diff={:.6e} max_rel_diff={:.6e} mismatched={}/{} | {}",
+        m, n, k, weight_global_scale, weight_row_scales.is_some(), row_scale_sample,
+        max_abs, max_rel, mismatched, got_v.len(), sample.join(" ")
+    );
+    let _ = Storage::Cpu;
+    Ok(())
+}
+
 /// Repack MLX NVFP4 weights from U32 to U8 on GPU.
 ///
 /// MLX stores FP4 E2M1 weights as U32 (8 nibbles per U32 in little-endian).
@@ -1036,6 +1428,215 @@ pub fn mlx_dequant_embedding(
         }
         _ => candle_core::bail!("mlx_dequant_embedding: unsupported backend (need CUDA or Metal)"),
     }
+}
+
+/// Repack NVFP4 weights for the SM70 HMMA.884 path and run the Volta kernel.
+///
+/// This is the SM70 (Tesla V100) counterpart of the WMMA path: Volta has no
+/// `m16n16k16` HMMA, only `m8n8k4`, and the weights have to be laid out so
+/// that one 32-bit word holds eight contiguous k of one output column.
+///
+/// The returned tensors are the repacked weights `[N, K/8]` (u32) and the
+/// repacked block scales `[N, K/8]` (u32, the FP8 E4M3 scale converted to
+/// half and duplicated in both halves).  Callers keep them for the lifetime
+/// of the layer so the repack happens once per layer, not once per token.
+#[cfg(feature = "cuda")]
+pub fn nvfp4_repack_weight_sm70(
+    weight: &Tensor,
+    scale: &Tensor,
+    weight_global_scale: f32,
+    column_global_scale: Option<&Tensor>,
+    n: usize,
+    k: usize,
+) -> Result<(Tensor, Tensor)> {
+    let dev = weight.device();
+    let cuda_dev = dev.as_cuda_device()?;
+    let stream = *cuda_dev.cu_stream() as i64;
+
+    let weight_out = Tensor::zeros((n, k / 8), DType::U32, dev)?;
+    let scale_out = Tensor::zeros((n, k / 8), DType::U32, dev)?;
+
+    let pointers = {
+    let (ws, _) = weight.storage_and_layout();
+    let (ss, _) = scale.storage_and_layout();
+    let (wo, _) = weight_out.storage_and_layout();
+    let (so, _) = scale_out.storage_and_layout();
+
+    let weight_ptr = match &*ws {
+        candle_core::Storage::Cuda(c) => {
+            *c.as_cuda_slice::<u8>()?.device_ptr() as *const u8
+        }
+        _ => candle_core::bail!("weight must be on CUDA"),
+    };
+    let scale_ptr = match &*ss {
+        candle_core::Storage::Cuda(c) => {
+            *c.as_cuda_slice::<u8>()?.device_ptr() as *const u8
+        }
+        _ => candle_core::bail!("scale must be on CUDA"),
+    };
+    let weight_out_ptr = match &*wo {
+        candle_core::Storage::Cuda(c) => {
+            *c.as_cuda_slice::<u32>()?.device_ptr() as *mut u32
+        }
+        _ => candle_core::bail!("weight_out must be on CUDA"),
+    };
+    let scale_out_ptr = match &*so {
+        candle_core::Storage::Cuda(c) => {
+            *c.as_cuda_slice::<u32>()?.device_ptr() as *mut u32
+        }
+        _ => candle_core::bail!("scale_out must be on CUDA"),
+    };
+
+    // The per-column global scale replaces the tensor-wide one for the
+    // columns it covers, mirroring what the generic NVFP4 path does.
+    let column_scale_ptr = if let Some(cs) = column_global_scale {
+        let (cs_s, _) = cs.storage_and_layout();
+        match &*cs_s {
+            candle_core::Storage::Cuda(c) => {
+                *c.as_cuda_slice::<f32>()?.device_ptr() as *const f32
+            }
+            _ => candle_core::bail!("column_global_scale must be on CUDA"),
+        }
+    } else {
+        std::ptr::null()
+    };
+
+    (weight_ptr, scale_ptr, weight_out_ptr, scale_out_ptr, column_scale_ptr)
+    };
+    let (weight_ptr, scale_ptr, weight_out_ptr, scale_out_ptr, column_scale_ptr) = pointers;
+
+    unsafe {
+        ffi::nvfp4_repack_weight_sm70(
+            weight_ptr,
+            scale_ptr,
+            weight_out_ptr,
+            scale_out_ptr,
+            column_scale_ptr,
+            weight_global_scale,
+            n as i32,
+            k as i32,
+            stream,
+        );
+    }
+    Ok((weight_out, scale_out))
+}
+
+/// Run the SM70 HMMA.884 NVFP4 GEMM.
+///
+/// `weight` and `weight_scale` are the repacked tensors produced by
+/// [`nvfp4_repack_weight_sm70`].  `weight_global_scale` multiplies the whole
+/// result; `weight_row_scales` optionally scales individual output columns.
+#[cfg(feature = "cuda")]
+pub fn nvfp4_matmul_hmma884(
+    input: &Tensor,
+    weight: &Tensor,
+    weight_scale: &Tensor,
+    weight_global_scale: f32,
+    bias: Option<&Tensor>,
+    weight_row_scales: Option<&Tensor>,
+) -> Result<Tensor> {
+    let input = if input.is_contiguous() {
+        input.clone()
+    } else {
+        input.contiguous()?
+    };
+    let input_dims = input.dims();
+    if input_dims.len() != 2 {
+        candle_core::bail!(
+            "nvfp4_matmul_hmma884: expected input rank 2, got {:?}",
+            input_dims
+        );
+    }
+    let m = input_dims[0];
+    let k = input_dims[1];
+    let n = weight.dims()[0];
+
+    let dev = input.device();
+    let dtype = input.dtype();
+    let cuda_dev = dev.as_cuda_device()?;
+    let stream = *cuda_dev.cu_stream() as i64;
+
+    let output = Tensor::zeros((m, n), dtype, dev)?;
+
+    let pointers = {
+    let (is, _) = input.storage_and_layout();
+    let (ws, _) = weight.storage_and_layout();
+    let (wss, _) = weight_scale.storage_and_layout();
+    let (os, _) = output.storage_and_layout();
+
+    let input_ptr = match &*is {
+        candle_core::Storage::Cuda(c) => {
+            *c.as_cuda_slice::<half::f16>()?.device_ptr() as *const half::f16
+        }
+        _ => candle_core::bail!("input must be on CUDA"),
+    };
+    let weight_ptr = match &*ws {
+        candle_core::Storage::Cuda(c) => {
+            *c.as_cuda_slice::<u32>()?.device_ptr() as *const u32
+        }
+        _ => candle_core::bail!("weight must be on CUDA"),
+    };
+    let scale_ptr = match &*wss {
+        candle_core::Storage::Cuda(c) => {
+            *c.as_cuda_slice::<u32>()?.device_ptr() as *const u32
+        }
+        _ => candle_core::bail!("weight_scale must be on CUDA"),
+    };
+    let output_ptr = match &*os {
+        candle_core::Storage::Cuda(c) => {
+            *c.as_cuda_slice::<half::f16>()?.device_ptr() as *mut half::f16
+        }
+        _ => candle_core::bail!("output must be on CUDA"),
+    };
+
+    let bias_ptr = if let Some(b) = bias {
+        let (bs, _) = b.storage_and_layout();
+        match &*bs {
+            candle_core::Storage::Cuda(c) => {
+                *c.as_cuda_slice::<half::f16>()?.device_ptr() as *const half::f16
+            }
+            _ => candle_core::bail!("bias must be on CUDA"),
+        }
+    } else {
+        std::ptr::null()
+    };
+
+    // The row scales are folded into the block scales by the repack, so the
+    // kernel does not apply them a second time.
+    let row_scales_ptr = if let Some(rs) = weight_row_scales {
+        let (rs_s, _) = rs.storage_and_layout();
+        match &*rs_s {
+            candle_core::Storage::Cuda(c) => {
+                *c.as_cuda_slice::<f32>()?.device_ptr() as *const f32
+            }
+            _ => candle_core::bail!("weight_row_scales must be on CUDA"),
+        }
+    } else {
+        std::ptr::null()
+    };
+
+    (input_ptr, weight_ptr, scale_ptr, output_ptr, bias_ptr, row_scales_ptr)
+    };
+    let (input_ptr, weight_ptr, scale_ptr, output_ptr, bias_ptr, row_scales_ptr) = pointers;
+
+    unsafe {
+        ffi::nvfp4_matmul_hmma884_f16(
+            input_ptr as *const std::ffi::c_void,
+            weight_ptr,
+            scale_ptr,
+            weight_global_scale,
+            row_scales_ptr as *const f32,
+            bias_ptr as *const std::ffi::c_void,
+            output_ptr as *mut std::ffi::c_void,
+            m as i32,
+            n as i32,
+            k as i32,
+            bias.is_some(),
+            stream,
+        );
+    }
+
+    Ok(output)
 }
 
 #[cfg(feature = "metal")]

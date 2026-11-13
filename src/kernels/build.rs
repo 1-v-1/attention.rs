@@ -81,6 +81,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/mxfp4_gemm.cu");
     println!("cargo:rerun-if-changed=src/mxfp4_gemm_wmma.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_gemm.cu");
+    println!("cargo:rerun-if-changed=src/nvfp4_gemm_sm70.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_gemm_cutlass.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_gemm_flashinfer.cu");
     println!("cargo:rerun-if-changed=src/nvfp4_gemm_flashinfer_sm103.cu");
@@ -130,7 +131,26 @@ fn main() -> Result<()> {
         println!("cargo:info=nvcc --threads={nvcc_threads}");
     }
 
+    // cudaforge keeps its incremental build cache (`.cudaforge_cache.json`)
+    // inside the output directory, and it hashes the nvcc arguments, which
+    // include the paths of the fetched git dependencies.  Those dependencies
+    // are fetched *into the output directory*, so the hash changes whenever
+    // cargo hands out a fresh OUT_DIR - and cargo does exactly that whenever
+    // any input of this crate changes.  The result is that every rebuild
+    // recompiles all ~90 translation units, including the cutlass-heavy
+    // FlashInfer adapters whose single translation unit takes tens of
+    // minutes in `cicc`.
+    //
+    // Pinning the output directory to a stable path under the crate keeps
+    // the cache alive across rebuilds, so only the files that actually
+    // changed are compiled again.
+    let stable_out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("cuda-kernels")
+        .join(std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string()));
+
     let mut builder = KernelBuilder::new()
+        .out_dir(&stable_out_dir)
         .source_dir("src")
         .nvcc_thread_patterns(
             &["flash_api", "flash_decode", "cutlass", "flashinfer"],
@@ -188,9 +208,16 @@ fn main() -> Result<()> {
 
     // The number of output rows a decode block covers.  More rows per block
     // means the activation row is staged once for more output columns.
-    if let Ok(v) = std::env::var("NVFP4_DECODE_BLOCK_ROWS") {
-        builder = builder.arg(&format!("-DNVFP4_DECODE_BLOCK_ROWS={v}"));
-        println!("cargo:info=NVFP4 decode block rows: {v}");
+    for (var, define) in [
+        ("NVFP4_DECODE_BLOCK_ROWS", "NVFP4_DECODE_BLOCK_ROWS"),
+        ("NVFP4_DECODE_BLOCK_ROWS_BATCH", "NVFP4_DECODE_BLOCK_ROWS_BATCH"),
+        ("NVFP4_DECODE_DUAL_ROW", "NVFP4_DECODE_DUAL_ROW"),
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+        if let Ok(v) = std::env::var(var) {
+            builder = builder.arg(&format!("-D{define}={v}"));
+            println!("cargo:info=NVFP4 decode {var}: {v}");
+        }
     }
 
     for (var, define) in [
@@ -204,10 +231,15 @@ fn main() -> Result<()> {
     }
 
     // The wmma tile shape is tunable from the environment for measurements.
+    // Without the rerun-if-env-changed lines cargo does not notice that the
+    // shape changed, so the next build silently reuses the previous kernel
+    // and the measurement describes the wrong tile.
     for (var, define) in [
-        ("NVFP4_WMMA_BM", "NVFP4_WMMA_BM"),
-        ("NVFP4_WMMA_BN", "NVFP4_WMMA_BN"),
+        ("NVFP4_WMMA_BM", "NVFP4_WMMA_BM_OVERRIDE"),
+        ("NVFP4_WMMA_BN", "NVFP4_WMMA_BN_OVERRIDE"),
+        ("NVFP4_WMMA_BK", "NVFP4_WMMA_BK"),
     ] {
+        println!("cargo:rerun-if-env-changed={var}");
         if let Ok(v) = std::env::var(var) {
             builder = builder.arg(&format!("-D{define}={v}"));
             println!("cargo:info=NVFP4 wmma {var}: {v}");
@@ -419,9 +451,9 @@ fn main() -> Result<()> {
 
     println!("cargo:info={builder:?}");
 
-    let _ = builder.build_lib(build_dir.join("libpagedattention.a"))?;
+    let _ = builder.build_lib(stable_out_dir.join("libpagedattention.a"))?;
 
-    println!("cargo:rustc-link-search={}", build_dir.display());
+    println!("cargo:rustc-link-search={}", stable_out_dir.display());
     println!("cargo:rustc-link-lib=pagedattention");
     if link_flashmla {
         println!("cargo:rustc-link-lib=static=flashmla_dsv4");
@@ -440,7 +472,7 @@ fn main() -> Result<()> {
     // Each directive needs its own key: cargo's `links` metadata is a
     // single key-value pair per key, so repeating a key would overwrite
     // the previous value.
-    println!("cargo:lib_search={}", build_dir.display());
+    println!("cargo:lib_search={}", stable_out_dir.display());
     println!("cargo:lib_pagedattention=pagedattention");
     if link_flashmla {
         println!("cargo:lib_flashmla=static=flashmla_dsv4");
