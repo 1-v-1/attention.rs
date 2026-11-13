@@ -1577,6 +1577,19 @@ pub fn nvfp4_repack_weight_sm70(
     };
     let (weight_ptr, scale_ptr, weight_out_ptr, scale_out_ptr, column_scale_ptr) = pointers;
 
+    unsafe {
+        ffi::nvfp4_repack_weight_sm70(
+            weight_ptr,
+            scale_ptr,
+            weight_out_ptr,
+            scale_out_ptr,
+            column_scale_ptr,
+            weight_global_scale,
+            n as i32,
+            k as i32,
+            stream,
+        );
+
     // Diagnostic: the GEMM output carries NaN, so look at what the repack
     // actually wrote into the block scales.
     {
@@ -1615,18 +1628,6 @@ pub fn nvfp4_repack_weight_sm70(
         );
     }
 
-    unsafe {
-        ffi::nvfp4_repack_weight_sm70(
-            weight_ptr,
-            scale_ptr,
-            weight_out_ptr,
-            scale_out_ptr,
-            column_scale_ptr,
-            weight_global_scale,
-            n as i32,
-            k as i32,
-            stream,
-        );
 
         // Cross-check the repack against the original packed weight.  The
         // repack rewrites the nibble order and folds the global scale into
@@ -1635,11 +1636,11 @@ pub fn nvfp4_repack_weight_sm70(
         if std::env::var("XINFER_NVFP4_SM70_REPACK_CHECK").is_ok() {
             let dev = weight.device();
             let diff = Tensor::zeros(1, DType::F32, dev)?;
-            let mismatch = Tensor::zeros(1, DType::I64, dev)?;
+            let mismatch = Tensor::zeros(1, DType::I32, dev)?;
             let (d_s, _) = diff.storage_and_layout();
             let (m_s, _) = mismatch.storage_and_layout();
             let d_ptr = cuda_ptr(&d_s, DType::F32)? as *mut f32;
-            let m_ptr = cuda_ptr(&m_s, DType::I64)? as *mut i32;
+            let m_ptr = cuda_ptr(&m_s, DType::I32)? as *mut i32;
             unsafe {
                 ffi::nvfp4_sm70_repack_check(
                     weight_ptr,
@@ -1656,7 +1657,7 @@ pub fn nvfp4_repack_weight_sm70(
                 );
             }
             let dv = diff.to_dtype(DType::F32)?.to_vec1::<f32>().unwrap_or_default();
-            let mv = mismatch.to_dtype(DType::I64)?.to_vec1::<i64>().unwrap_or_default();
+            let mv = mismatch.to_dtype(DType::I32)?.to_vec1::<i32>().unwrap_or_default();
             eprintln!(
                 "[diag][repack-check] n={n} k={k} gscale={weight_global_scale}                  max_diff={:?} mismatch={:?}",
                 dv.first(),
