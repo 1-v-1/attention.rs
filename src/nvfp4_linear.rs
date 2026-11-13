@@ -1577,6 +1577,44 @@ pub fn nvfp4_repack_weight_sm70(
     };
     let (weight_ptr, scale_ptr, weight_out_ptr, scale_out_ptr, column_scale_ptr) = pointers;
 
+    // Diagnostic: the GEMM output carries NaN, so look at what the repack
+    // actually wrote into the block scales.
+    {
+        let stat = |t: &Tensor| {
+            t.to_dtype(DType::F32)
+                .ok()
+                .and_then(|x| x.flatten_all().ok())
+                .and_then(|x| x.to_vec1::<f32>().ok())
+                .map(|v| {
+                    let mut nan = 0usize;
+                    let mut inf = 0usize;
+                    let mut mn = f32::INFINITY;
+                    let mut mx = f32::NEG_INFINITY;
+                    for x in &v {
+                        if x.is_nan() { nan += 1; }
+                        else if x.is_infinite() { inf += 1; }
+                        else { mn = mn.min(*x); mx = mx.max(*x); }
+                    }
+                    (v.len(), nan, inf, mn, mx, v.first().copied())
+                })
+        };
+        // The raw block scale is an FP8 E4M3 byte; read it as a number.
+        let raw = scale
+            .to_dtype(DType::U8)
+            .ok()
+            .and_then(|x| x.flatten_all().ok())
+            .and_then(|x| x.to_vec1::<u8>().ok())
+            .map(|v| {
+                let mn = v.iter().copied().min().unwrap_or(0);
+                let mx = v.iter().copied().max().unwrap_or(0);
+                (v.len(), mn, mx)
+            });
+        let folded = stat(&scale_out);
+        eprintln!(
+            "[diag][repack] n={n} k={k} gscale={weight_global_scale} raw_fp8={raw:?} folded_f16={folded:?}"
+        );
+    }
+
     unsafe {
         ffi::nvfp4_repack_weight_sm70(
             weight_ptr,

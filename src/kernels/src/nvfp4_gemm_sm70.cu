@@ -272,6 +272,17 @@ __global__ void nvfp4_repack_weight_sm70_kernel(
   // The scale is a plain half: the GEMM kernel broadcasts it into both halves
   // of the shared-memory entry when it loads it.
   scale_out[idx] = h;
+
+  // Diagnostic: the GEMM produces NaN, so report the raw scale values and
+  // the folded one for the first few entries.
+  if (idx < 4) {
+    const float raw = dispatch_fp8_to_float(weight_scale[(size_t)n * (K / 16) + group]);
+    fprintf(stderr,
+            "[diag][repack-cu] n=%d group=%d raw_fp8=%.9g gscale=%.9g sf=%.9g "
+            "half=%.9g\n",
+            n, group, raw, gscale, sf, __half2float(h));
+    fflush(stderr);
+  }
 }
 
 // ---------------------------------------------------------------------------
