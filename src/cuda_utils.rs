@@ -22,21 +22,24 @@ static SM_CACHE: OnceLock<Mutex<HashMap<usize, Option<i32>>>> = OnceLock::new();
 #[cfg(feature = "cuda")]
 pub fn sm_version_without_context(ordinal: i32) -> Option<i32> {
     use candle_core::cuda_backend::cudarc::driver::result;
-    use candle_core::cuda_backend::WrapErr;
 
     // The driver has to be initialised before any other call.
-    unsafe {
-        sys::lib().cu_init(0).w().ok()?;
-    }
+    result::init().ok()?;
     let device = result::device::get(ordinal).ok()?;
-    let major = device
-        .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-        .w()
-        .ok()?;
-    let minor = device
-        .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
-        .w()
-        .ok()?;
+    let major = unsafe {
+        result::device::get_attribute(
+            device,
+            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        )
+    }
+    .ok()?;
+    let minor = unsafe {
+        result::device::get_attribute(
+            device,
+            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+        )
+    }
+    .ok()?;
     Some(major * 10 + minor)
 }
 
