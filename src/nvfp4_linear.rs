@@ -1627,6 +1627,42 @@ pub fn nvfp4_repack_weight_sm70(
             k as i32,
             stream,
         );
+
+        // Cross-check the repack against the original packed weight.  The
+        // repack rewrites the nibble order and folds the global scale into
+        // the block scales, and nothing else verifies that rewrite, so a
+        // mistake there silently poisons every layer.
+        if std::env::var("XINFER_NVFP4_SM70_REPACK_CHECK").is_ok() {
+            let dev = weight.device();
+            let diff = Tensor::zeros(1, DType::F32, dev)?;
+            let mismatch = Tensor::zeros(1, DType::I64, dev)?;
+            let (d_s, _) = diff.storage_and_layout();
+            let (m_s, _) = mismatch.storage_and_layout();
+            let d_ptr = cuda_ptr(&d_s, DType::F32)? as *mut f32;
+            let m_ptr = cuda_ptr(&m_s, DType::I64)? as *mut i32;
+            unsafe {
+                ffi::nvfp4_sm70_repack_check(
+                    weight_ptr,
+                    scale_ptr,
+                    weight_out_ptr,
+                    scale_out_ptr,
+                    weight_global_scale,
+                    n as i32,
+                    k as i32,
+                    d_ptr,
+                    m_ptr,
+                    8,
+                    stream,
+                );
+            }
+            let dv = diff.to_dtype(DType::F32)?.to_vec1::<f32>().unwrap_or_default();
+            let mv = mismatch.to_dtype(DType::I64)?.to_vec1::<i64>().unwrap_or_default();
+            eprintln!(
+                "[diag][repack-check] n={n} k={k} gscale={weight_global_scale}                  max_diff={:?} mismatch={:?}",
+                dv.first(),
+                mv.first()
+            );
+        }
     }
     Ok((weight_out, scale_out))
 }

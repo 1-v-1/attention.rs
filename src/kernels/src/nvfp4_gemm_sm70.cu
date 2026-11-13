@@ -586,6 +586,13 @@ __launch_bounds__(SM70_NVFP4_WARP_SIZE * kWarps) __global__
     const int quad_base = warp_col0 + q * 8;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
+      // The C fragment of the 884 atom.  1Cat's reference layout
+      // (`benchmarks/csrc/sm70_raw_hmma_probe.cu`) puts the row at
+      //   (lane & 1) + (reg & 2) + ((lane >> 4) * 4)
+      // and the column at
+      //   (lane & 12) * 2 + (lane & 2) + (reg & 4) + (reg & 1)
+      // The n-tile part `(lane & 12) * 2` selects one of the four eight
+      // column quads of the warp, and `reg & 4` the second half of it.
       const int r = (lane & 1) + (i & 2) + 4 * ((lane >= 16) ? 1 : 0);
       const int c = (lane & 2) + (i & 1) + 4 * ((i >> 2) & 1);
       const int gcol = quad_base + c;
@@ -739,4 +746,66 @@ extern "C" void nvfp4_matmul_hmma884_f16(const __half *input,
   if (M <= 0 || N <= 0 || K <= 0) return;
   launch_hmma884_auto(input, weight, weight_scale, weight_row_scales, bias,
                       output, M, N, K, has_bias, stream);
+}
+
+// ---------------------------------------------------------------------------
+// Device-side cross-check of the SM70 repack.
+//
+// The repack rewrites the weight into the layout the HMMA.884 atom expects
+// and folds the global scale into the block scales.  Nothing on the host
+// checks that rewrite, so a mistake in the nibble order or in the scale
+// folding produces garbage that only shows up as a NaN many layers later.
+//
+// This kernel decodes the repacked weight back to a float and compares it
+// against the same weight decoded from the original packed layout, for the
+// first few output columns.  `out_diff` receives the largest absolute
+// difference and the number of mismatching elements.
+//
+// The comparison is exact in the scale domain: the reference decodes the
+// original nibbles with the software LUT and applies the folded scale the
+// same way, so any difference points at the repack.
+// ---------------------------------------------------------------------------
+extern "C" void nvfp4_sm70_repack_check(const uint8_t *__restrict__ weight,
+                                         const uint8_t *__restrict__ weight_scale,
+                                         const uint32_t *__restrict__ weight_out,
+                                         const __half *__restrict__ scale_out,
+                                         float global_scale, int N, int K,
+                                         float *__restrict__ out_diff,
+                                         int *__restrict__ out_mismatch,
+                                         int max_cols) {
+  // The FP4 E2M1 values, indexed by the nibble.
+  const float lut[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,
+                         6.0f,  -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f,
+                         -4.0f, -6.0f};
+
+  const int cols = N < max_cols ? N : max_cols;
+  const int total = cols * K;
+  const int stride = gridDim.x * blockDim.x;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += stride) {
+    const int n = idx / K;
+    const int k = idx % K;
+    const int group = k / 16;
+
+    // The reference: the original packed weight, two nibbles per byte with
+    // the low nibble at the smaller k.
+    const uint8_t src = weight[(size_t)n * (K / 2) + (k / 2)];
+    const uint32_t nib = (k & 1) ? (src >> 4) : (src & 0xFu);
+    const float raw = lut[nib];
+
+    // The folded block scale of this group.
+    const float folded = __half2float(scale_out[(size_t)n * (K / 16) + group]);
+
+    // The repacked weight: eight contiguous k per word, the nibble j of the
+    // word holding the element j.
+    const uint32_t word = weight_out[(size_t)n * (K / 8) + (k / 8)];
+    const uint32_t packed = (word >> (4 * (k % 8))) & 0xFu;
+    const float repacked = lut[packed];
+
+    const float a = raw * folded;
+    const float b = repacked * folded;
+    const float d = fabsf(a - b);
+    if (d > out_diff[0]) out_diff[0] = d;
+    if (a != b) atomicAdd(out_mismatch, 1);
+  }
 }

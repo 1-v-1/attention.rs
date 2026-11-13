@@ -3102,6 +3102,21 @@ extern "C" {
         stream: i64,
     );
 
+    /// Cross-check the SM70 repack against the original packed weight.
+    pub fn nvfp4_sm70_repack_check(
+        weight: *const u8,
+        weight_scale: *const u8,
+        weight_out: *const u32,
+        scale_out: *const u16,
+        global_scale: f32,
+        n: c_int,
+        k: c_int,
+        out_diff: *mut f32,
+        out_mismatch: *mut c_int,
+        max_cols: c_int,
+        stream: i64,
+    );
+
     /// SM70 (Volta) HMMA.884 NVFP4 GEMM.
     pub fn nvfp4_matmul_hmma884_f16(
         input: *const c_void,
