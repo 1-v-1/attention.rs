@@ -1521,7 +1521,7 @@ pub fn nvfp4_repack_weight_sm70(
     };
     let scale_out_ptr = match &*so {
         candle_core::Storage::Cuda(c) => {
-            *c.as_cuda_slice::<u16>()?.device_ptr() as *mut u16
+            *c.as_cuda_slice::<half::f16>()?.device_ptr() as *mut u16
         }
         _ => candle_core::bail!("scale_out must be on CUDA"),
     };
@@ -1646,7 +1646,7 @@ pub fn nvfp4_matmul_hmma884(
     };
     let scale_ptr = match &*wss {
         candle_core::Storage::Cuda(c) => {
-            *c.as_cuda_slice::<u16>()?.device_ptr() as *const u16
+            *c.as_cuda_slice::<half::f16>()?.device_ptr() as *const u16
         }
         _ => candle_core::bail!("weight_scale must be on CUDA"),
     };
