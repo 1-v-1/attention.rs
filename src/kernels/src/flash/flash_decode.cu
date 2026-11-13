@@ -84,6 +84,7 @@
 #undef LDG_VEC_DEFINED
 #undef LDG_VEC_LOAD
 
+#if !defined(FLASH_SM70_NO_HDIM512)
 #define FLASH_HDIM 512
 #define GQA_RATIO 1
 #define flash_decode_paged      flash_decode_paged_512
@@ -98,6 +99,7 @@
 #undef WARP_SIZE
 #undef HDIM
 #undef VEC_BF16
+#endif  // !FLASH_SM70_NO_HDIM512
 #undef VEC_U32
 #undef NUM_WARPS
 #undef BC
@@ -139,13 +141,13 @@ extern "C" void call_flash_decode_paged(
     if (dtype == 0) {
         if (head_dim <= 128)      { LAUNCH_DECODE_T(__half, 128); }
         else if (head_dim <= 256) { LAUNCH_DECODE_T(__half, 256); }
-        else                      { LAUNCH_DECODE_T(__half, 512); }
+        else                      { LAUNCH_DECODE_T(__half, 256); }
     }
 #ifndef NO_BF16_KERNEL
     else if (dtype == 1) {
         if (head_dim <= 128)      { LAUNCH_DECODE_T(__nv_bfloat16, 128); }
         else if (head_dim <= 256) { LAUNCH_DECODE_T(__nv_bfloat16, 256); }
-        else                      { LAUNCH_DECODE_T(__nv_bfloat16, 512); }
+        else                      { LAUNCH_DECODE_T(__nv_bfloat16, 256); }
     }
 #endif
     else {

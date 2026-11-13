@@ -7,6 +7,85 @@
 #include <algorithm>
 
 #ifdef USE_FLASHINFER
+    // The Volta build reduces the number of head-dimension / GQA-group-size
+    // combinations that get instantiated.  The upstream dispatch macros live
+    // in `flashinfer/utils.cuh` and cover four head dimensions times ten
+    // group sizes; every combination pulls in a full paged-KV decode plan
+    // template.  `cicc` compiles the instantiations of one translation unit
+    // serially, so the adapter that holds them is the single slowest file in
+    // the build.
+    //
+    // The macros have to be replaced *before* `decode.cuh` is included, because
+    // FlashInfer's own `BatchDecodeWithPagedKVCacheDispatched` dispatches on
+    // the group size internally.  Overriding them here therefore shrinks both
+    // our own dispatch sites and the ones inside the FlashInfer header.
+    //
+    // The runtime only accepts the group sizes listed below on Volta (see
+    // `flashinfer_group_size_set` in `src/flashinfer.rs`), so a model that
+    // needs a different group size is rejected before it reaches a kernel
+    // that was never compiled.
+    #if defined(SM_70_PASS)
+        #include <flashinfer/utils.cuh>
+        #undef DISPATCH_GQA_GROUP_SIZE
+        #undef DISPATCH_HEAD_DIM
+    #endif
+
+// Volta replacements for the upstream dispatch macros.
+//
+// These are defined after `flashinfer/utils.cuh` (which owns the upstream
+// definitions) and before any template that dispatches on them is
+// instantiated.  They cover the head dimensions and GQA group sizes that the
+// Volta build actually compiles:
+//
+//   head_dim   : 128, 256              (upstream: 64, 128, 256, 512)
+//   group_size : 1, 2, 4, 6, 8          (upstream: 1,2,3,4,5,6,8,16,32,64)
+//
+// The fallback branch has to be valid in every context these macros are
+// used in: our own wrappers return `void`, while FlashInfer's
+// `SingleDecodeWithKVCacheDispatched` and
+// `BatchDecodeWithPagedKVCacheDispatched` return `cudaError_t`.  A plain
+// `return;` does not compile in the latter, so the fallback throws instead,
+// exactly like the upstream macros do.  The throw never actually happens:
+// the runtime rejects an unsupported head dimension or group size before it
+// reaches the dispatch.
+#if defined(SM_70_PASS)
+#define DISPATCH_HEAD_DIM_SM70(HEAD_DIM_VALUE, HEAD_DIM, ...) \
+    if ((HEAD_DIM_VALUE) == 128) {                             \
+        constexpr size_t HEAD_DIM = 128;                      \
+        __VA_ARGS__                                            \
+    } else if ((HEAD_DIM_VALUE) == 256) {                      \
+        constexpr size_t HEAD_DIM = 256;                      \
+        __VA_ARGS__                                            \
+    } else {                                                  \
+        FLASHINFER_ERROR("head_dim is not compiled for this architecture"); \
+    }
+
+#define DISPATCH_GQA_GROUP_SIZE_SM70(group_size, GROUP_SIZE, ...) \
+    if ((group_size) == 1) {                                    \
+        constexpr size_t GROUP_SIZE = 1;                        \
+        __VA_ARGS__                                             \
+    } else if ((group_size) == 2) {                             \
+        constexpr size_t GROUP_SIZE = 2;                        \
+        __VA_ARGS__                                             \
+    } else if ((group_size) == 4) {                             \
+        constexpr size_t GROUP_SIZE = 4;                        \
+        __VA_ARGS__                                             \
+    } else if ((group_size) == 6) {                             \
+        constexpr size_t GROUP_SIZE = 6;                        \
+        __VA_ARGS__                                             \
+    } else if ((group_size) == 8) {                             \
+        constexpr size_t GROUP_SIZE = 8;                        \
+        __VA_ARGS__                                             \
+    } else {                                                    \
+        FLASHINFER_ERROR("gqa group_size is not compiled for this architecture"); \
+    }
+
+// Replace the upstream macros with the reduced sets.  `utils.cuh` was
+// included above, so the upstream definitions are visible here.
+#define DISPATCH_HEAD_DIM DISPATCH_HEAD_DIM_SM70
+#define DISPATCH_GQA_GROUP_SIZE DISPATCH_GQA_GROUP_SIZE_SM70
+#endif  // SM_70_PASS
+
     #include <flashinfer/attention/decode.cuh>
     #include <flashinfer/attention/scheduler.cuh>
     #if defined(SM_90_PASS)
@@ -23,6 +102,11 @@
 #include <flashinfer/page.cuh>
 #include <flashinfer/utils.cuh>
 
+
+// The CUTLASS numeric types are only needed by the SM90 path, which uses
+// them as the dtype tags for its plan.  Including the header
+// unconditionally drags in the whole CUTLASS 3.x collective template
+// stack, and that is most of the compile time of the FlashInfer adapters.
 #if defined(SM_90_PASS)
 #include <cutlass/numeric_types.h>
 #endif
@@ -281,67 +365,10 @@ static inline bool IsSupportedDecodeHeadDimForGroupSize(uint32_t group_size, uin
 // ---------------------------------------------------------------------------
 // Dispatch selection.
 //
-// The SM70 build uses the reduced sets above; every other architecture uses
-// the full FlashInfer dispatch.
+// The SM70 macros themselves are defined near the top of this file, right
+// after `flashinfer/utils.cuh` is included, so that they also replace the
+// dispatch inside FlashInfer's own headers.
 // ---------------------------------------------------------------------------
-#if defined(SM_70_PASS)
-#define FLASHINFER_DISPATCH_HEAD_DIM DISPATCH_HEAD_DIM_SM70
-#define FLASHINFER_DISPATCH_GQA_GROUP_SIZE DISPATCH_GQA_GROUP_SIZE_SM70
-#else
-#define FLASHINFER_DISPATCH_HEAD_DIM DISPATCH_HEAD_DIM
-#define FLASHINFER_DISPATCH_GQA_GROUP_SIZE DISPATCH_GQA_GROUP_SIZE
-#endif
-
-// ---------------------------------------------------------------------------
-// SM70 (Volta) dispatch.
-//
-// The generic FlashInfer dispatch instantiates the paged-KV decode plan for
-// every combination of head dimension and GQA group size: three head
-// dimensions times ten group sizes is thirty template instantiations, each
-// of which drags in the whole CUTLASS and FlashInfer template stack.  `cicc`
-// compiles the instantiations of a single translation unit serially, so that
-// one file takes fifty minutes on its own.
-//
-// Volta has no tensor-core path for the wider head dimensions and the
-// models that run there use a handful of group sizes, so the build
-// instantiates only those.  The set is a superset of what the SM70 models
-// need, and the runtime still rejects anything outside it.
-// ---------------------------------------------------------------------------
-#if defined(SM_70_PASS)
-#define DISPATCH_HEAD_DIM_SM70(HEAD_DIM_VALUE, HEAD_DIM, ...) \
-    if ((HEAD_DIM_VALUE) == 128) {                             \
-        constexpr uint32_t HEAD_DIM = 128;                     \
-        __VA_ARGS__;                                           \
-    } else if ((HEAD_DIM_VALUE) == 256) {                      \
-        constexpr uint32_t HEAD_DIM = 256;                     \
-        __VA_ARGS__;                                           \
-    } else {                                                   \
-        return;                                                \
-    }
-
-// The group sizes a Volta model can produce: MHA (1), MQA (2), grouped
-// query with two or four groups, and the eight-way grouping that the
-// Qwen3 family uses.
-#define DISPATCH_GQA_GROUP_SIZE_SM70(group_size, GROUP_SIZE, ...) \
-    if ((group_size) == 1) {                                    \
-        constexpr size_t GROUP_SIZE = 1;                        \
-        __VA_ARGS__                                             \
-    } else if ((group_size) == 2) {                             \
-        constexpr size_t GROUP_SIZE = 2;                        \
-        __VA_ARGS__                                             \
-    } else if ((group_size) == 4) {                             \
-        constexpr size_t GROUP_SIZE = 4;                        \
-        __VA_ARGS__                                             \
-    } else if ((group_size) == 6) {                             \
-        constexpr size_t GROUP_SIZE = 6;                        \
-        __VA_ARGS__                                             \
-    } else if ((group_size) == 8) {                             \
-        constexpr size_t GROUP_SIZE = 8;                        \
-        __VA_ARGS__                                             \
-    } else {                                                    \
-        return;                                                 \
-    }
-#endif
 
 #if defined(SM_90_PASS)
 #define DISPATCH_HEAD_DIM_SM90(HEAD_DIM_VALUE, HEAD_DIM, ...) \

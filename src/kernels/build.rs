@@ -156,10 +156,10 @@ fn main() -> Result<()> {
     // The cache therefore lives under the cargo target directory of the
     // *workspace* that drives the build, which is stable across revisions.
     // `OUT_DIR` is `<target>/<profile>/build/<crate>-<hash>/out`, so
-    // `ancestors().nth(3)` is `<target>`.
+    // `ancestors().nth(4)` is `<target>`.
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default());
-    let workspace_target = out_dir.ancestors().nth(3).map(Path::to_path_buf);
+    let workspace_target = out_dir.ancestors().nth(4).map(Path::to_path_buf);
     let stable_out_dir = match workspace_target {
         // Sanity check: the path has to end in the cargo target directory,
         // otherwise the ancestors walk did not land where we expect.
@@ -292,9 +292,33 @@ fn main() -> Result<()> {
     if std::env::var("CARGO_FEATURE_CUTLASS").is_ok()
         || std::env::var("CARGO_FEATURE_FLASHINFER").is_ok()
     {
-        builder = builder
-            .arg("-DUSE_CUTLASS")
-            .with_cutlass(Some("b46b16d003484063bca4ed365e44095c4c6ed633"));
+        // The CUTLASS 3.x collective template stack is only reachable from the
+        // sm90+ GEMM dispatch: `fp8_gemm_cutlass.cu` and `fp8_moe_cutlass.cu`
+        // guard every kernel behind `sm_version >= 90`, and the FP4 variants
+        // behind `ENABLE_FP4_SM100` / `ENABLE_FP4_SM120`, which are only
+        // defined from sm100 up.  On Volta none of those branches run, so
+        // compiling the templates in is pure build time: `cicc` has to
+        // instantiate the whole collective builder stack, and that dominated
+        // the build.
+        //
+        // 1Cat does the same thing from the other direction: it ships a
+        // separate SM70 kernel family (TurboMind FP8/NVFP4/AWQ) and never
+        // routes Volta through CUTLASS at all.
+        //
+        // The plain CUDA helpers in those same files (row shuffle/scatter,
+        // per-token-group quantization) are still needed, so the files are
+        // built with `USE_CUTLASS` off and their `#else` stubs supply the
+        // symbols the Rust side links against.
+        let cutlass_reachable = compute_cap >= 90;
+        if cutlass_reachable {
+            builder = builder.arg("-DUSE_CUTLASS");
+        } else {
+            println!(
+                "cargo:info=CUTLASS disabled: sm{} has no reachable CUTLASS GEMM path",
+                compute_cap
+            );
+        }
+        builder = builder.with_cutlass(Some("b46b16d003484063bca4ed365e44095c4c6ed633"));
 
         if compute_cap >= 100 {
             builder = builder
@@ -330,6 +354,15 @@ fn main() -> Result<()> {
             // `cicc` on its own.
             if compute_cap < 80 {
                 builder = builder.arg("-DSM_70_PASS");
+                // The native flash attention kernels are instantiated for head
+                // dimensions 128, 256 and 512.  The 512 variant needs
+                // (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4 = 101120 B
+                // of dynamic shared memory, while SM70 caps the opt-in
+                // dynamic allocation at 64 KB, so the kernel cannot run on
+                // Volta at all.  Leaving it out of the build removes a third
+                // of the instantiations in `flash_instantiate.cu`, which is the
+                // second largest translation unit in the build.
+                builder = builder.arg("-DFLASH_SM70_NO_HDIM512");
             }
             let flashinfer_sw_fp8 = std::env::var("ENABLE_FLASHINFER_SOFTWARE_FP8").is_ok();
             // SM70/SM75 (Volta/Turing) have no hardware FP8, but the FA2 batch

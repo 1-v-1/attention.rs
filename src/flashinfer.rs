@@ -13,17 +13,58 @@ pub(crate) use crate::workspace::{
     WORKSPACE_FLOAT_SIZE,
 };
 
-fn is_supported_flashinfer_gqa_group_size(group_size: usize) -> bool {
-    matches!(group_size, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64)
+/// The group sizes the compiled kernels cover on this device.
+///
+/// The Volta build compiles a reduced set of group sizes, because the
+/// paged-KV templates are instantiated once per (head dimension, group
+/// size) pair and `cicc` compiles the instantiations of a translation unit
+/// serially.  A group size the build does not cover has to be rejected
+/// here rather than silently returning without running anything.
+fn flashinfer_group_size_set(dev: &candle_core::cuda_backend::CudaDevice) -> &'static [usize] {
+    if crate::cuda_utils::sm_version(dev) == Some(70) {
+        return &[1, 2, 4, 6, 8];
+    }
+    &[1, 2, 3, 4, 5, 6, 8, 16, 32, 64]
 }
 
-fn is_supported_flashinfer_decode_group_size(group_size: usize) -> bool {
-    matches!(group_size, 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 32 | 64)
+fn is_supported_flashinfer_gqa_group_size(
+    dev: &candle_core::cuda_backend::CudaDevice,
+    group_size: usize,
+) -> bool {
+    flashinfer_group_size_set(dev).contains(&group_size)
+}
+
+fn is_supported_flashinfer_decode_group_size(
+    dev: &candle_core::cuda_backend::CudaDevice,
+    group_size: usize,
+) -> bool {
+    flashinfer_group_size_set(dev).contains(&group_size)
 }
 
 fn is_supported_flashinfer_decode_shape(group_size: usize, head_dim: usize) -> bool {
     // decode launch can exceed 1024 threads for (group_size=64, head_dim=256)
     !(group_size == 64 && head_dim > 128)
+}
+
+/// The head dimensions the compiled kernels cover on this device.
+///
+/// The Volta build only compiles the 128 and 256 variants; the upstream
+/// dispatch also covers 64 and 512, and neither can run on Volta.  A head
+/// dimension outside the compiled set has to be rejected here, because the
+/// dispatch macro inside the CUDA kernel is the last line of defence and it
+/// reports the problem as a thrown C++ exception.
+fn flashinfer_head_dim_set(dev: &candle_core::cuda_backend::CudaDevice) -> &'static [usize] {
+    if crate::cuda_utils::sm_version(dev) == Some(70) {
+        return &[128, 256];
+    }
+    &[64, 128, 256, 512]
+}
+
+fn is_supported_flashinfer_head_dim(
+    dev: &candle_core::cuda_backend::CudaDevice,
+    head_dim: usize,
+) -> bool {
+    flashinfer_head_dim_set(dev).contains(&head_dim)
 }
 
 pub(crate) fn get_cuda_ptr(t: &Tensor) -> Result<*const core::ffi::c_void> {
@@ -431,6 +472,7 @@ impl FlashInferDecodeWithPlan {
         q_l: &Layout,
     ) -> Result<(CudaStorage, candle::Shape)> {
         let dev = q.device();
+        let cuda_dev = dev.as_cuda_device()?;
         let (batch_size, _, _) = q_l.shape().dims3()?;
         if self.num_kv_heads == 0 || self.num_qo_heads % self.num_kv_heads != 0 {
             candle::bail!(
@@ -440,10 +482,18 @@ impl FlashInferDecodeWithPlan {
             );
         }
         let group_size = self.num_qo_heads / self.num_kv_heads;
-        if !is_supported_flashinfer_decode_group_size(group_size) {
+        if !is_supported_flashinfer_decode_group_size(&cuda_dev, group_size) {
             candle::bail!(
-                "flashinfer decode only supports gqa group_size in [1,2,3,4,8,16,32,64], got {}",
+                "flashinfer decode only supports gqa group_size in {:?}, got {}",
+                flashinfer_group_size_set(&cuda_dev),
                 group_size
+            );
+        }
+        if !is_supported_flashinfer_head_dim(&cuda_dev, self.head_dim) {
+            candle::bail!(
+                "flashinfer decode head_dim={} is not compiled for this device; supported: {:?}",
+                self.head_dim,
+                flashinfer_head_dim_set(&cuda_dev)
             );
         }
         if !is_supported_flashinfer_decode_shape(group_size, self.head_dim) {
@@ -657,10 +707,18 @@ pub fn decode_plan(
         );
     }
     let group_size = num_qo_heads / num_kv_heads;
-    if !is_supported_flashinfer_decode_group_size(group_size) {
+    if !is_supported_flashinfer_decode_group_size(&dev, group_size) {
         candle::bail!(
-            "flashinfer decode only supports gqa group_size in [1,2,3,4,8,16,32,64], got {}",
+            "flashinfer decode only supports gqa group_size in {:?}, got {}",
+            flashinfer_group_size_set(&dev),
             group_size
+        );
+    }
+    if !is_supported_flashinfer_head_dim(&dev, head_dim) {
+        candle::bail!(
+            "flashinfer decode head_dim={} is not compiled for this device; supported: {:?}",
+            head_dim,
+            flashinfer_head_dim_set(&dev)
         );
     }
     if !is_supported_flashinfer_decode_shape(group_size, head_dim) {
@@ -1047,6 +1105,14 @@ impl FlashInferPrefillWithPlan {
         q_l: &Layout,
     ) -> Result<(CudaStorage, candle::Shape)> {
         let dev = q.device();
+        let cuda_dev = dev.as_cuda_device()?;
+        if !is_supported_flashinfer_head_dim(&cuda_dev, self.head_dim) {
+            candle::bail!(
+                "flashinfer prefill head_dim={} is not compiled for this device; supported: {:?}",
+                self.head_dim,
+                flashinfer_head_dim_set(&cuda_dev)
+            );
+        }
 
         let kc_ptr = get_cuda_ptr(&self.key_cache)?;
         let vc_ptr = get_cuda_ptr(&self.value_cache)?;
@@ -1391,6 +1457,7 @@ impl FlashInferRaggedPrefill {
         q_l: &Layout,
     ) -> Result<(CudaStorage, candle::Shape)> {
         let dev = q.device();
+        let cuda_dev = dev.as_cuda_device()?;
         if self.num_kv_heads == 0 || self.num_qo_heads % self.num_kv_heads != 0 {
             candle::bail!(
                 "invalid flashinfer ragged prefill head config: qo_heads={} kv_heads={}",
@@ -1399,9 +1466,17 @@ impl FlashInferRaggedPrefill {
             );
         }
         let group_size = self.num_qo_heads / self.num_kv_heads;
-        if !is_supported_flashinfer_gqa_group_size(group_size) {
+        if !is_supported_flashinfer_head_dim(&cuda_dev, self.head_dim) {
             candle::bail!(
-                "flashinfer ragged prefill only supports gqa group_size in [1,2,3,4,8,16,32,64], got {}",
+                "flashinfer ragged prefill head_dim={} is not compiled for this device; supported: {:?}",
+                self.head_dim,
+                flashinfer_head_dim_set(&cuda_dev)
+            );
+        }
+        if !is_supported_flashinfer_gqa_group_size(&cuda_dev, group_size) {
+            candle::bail!(
+                "flashinfer ragged prefill only supports gqa group_size in {:?}, got {}",
+                flashinfer_group_size_set(&cuda_dev),
                 group_size
             );
         }

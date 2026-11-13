@@ -293,7 +293,14 @@
 
 // ============================================================================
 // HDIM=512 variants
+//
+// Volta cannot run these kernels: the prefill layout needs
+// (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4 = 101120 B of dynamic
+// shared memory, while SM70 caps the opt-in dynamic allocation at 64 KB.
+// The kernels would be compiled and then never launched, so they are left
+// out of the Volta build.
 // ============================================================================
+#if !defined(FLASH_SM70_NO_HDIM512)
 #define FLASH_HDIM 512
 #define flash_prefill_paged flash_prefill_paged_512
 #define flash_prefill_paged_fp8 flash_prefill_paged_fp8_512
@@ -392,6 +399,7 @@
 #undef TQ3_K_BYTES_PER_HEAD
 #undef TQ3_QUANT_HELPERS_DEFINED
 #undef MAX_GQA_RATIO
+#endif  // !FLASH_SM70_NO_HDIM512
 
 // ============================================================================
 // Dispatch launchers — called from Rust FFI
@@ -446,11 +454,19 @@ extern "C" void call_flash_prefill_paged(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(256, 128, smem);
         } else {
+            // HDIM 512 is not compiled on Volta: it needs 101120 B of
+            // dynamic shared memory, more than SM70's 64 KB opt-in limit.
+            // Fall through to the HDIM 256 kernel instead.
+        #if !defined(FLASH_SM70_NO_HDIM512)
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(512, 256, smem);
+        #else
+            smem = 0;
+            LAUNCH_PREFILL(256, 128, smem);
+        #endif
         }
 #undef LAUNCH_PREFILL
 #undef HALF
@@ -483,11 +499,19 @@ extern "C" void call_flash_prefill_paged(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(256, 128, smem);
         } else {
+            // HDIM 512 is not compiled on Volta: it needs 101120 B of
+            // dynamic shared memory, more than SM70's 64 KB opt-in limit.
+            // Fall through to the HDIM 256 kernel instead.
+        #if !defined(FLASH_SM70_NO_HDIM512)
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(512, 256, smem);
+        #else
+            smem = 0;
+            LAUNCH_PREFILL(256, 128, smem);
+        #endif
         }
 #undef LAUNCH_PREFILL
 #undef HALF
@@ -539,11 +563,19 @@ extern "C" void call_flash_prefill_paged_fp8(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL_FP8(256, 128, smem);
         } else {
+            // HDIM 512 is not compiled on Volta: it needs 101120 B of
+            // dynamic shared memory, more than SM70's 64 KB opt-in limit.
+            // Fall through to the HDIM 256 kernel instead.
+        #if !defined(FLASH_SM70_NO_HDIM512)
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_fp8_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL_FP8(512, 256, smem);
+        #else
+            smem = 0;
+            LAUNCH_PREFILL_FP8(256, 128, smem);
+        #endif
         }
 #undef LAUNCH_PREFILL_FP8
 #undef HALF
@@ -577,11 +609,19 @@ extern "C" void call_flash_prefill_paged_fp8(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL_FP8(256, 128, smem);
         } else {
+            // HDIM 512 is not compiled on Volta: it needs 101120 B of
+            // dynamic shared memory, more than SM70's 64 KB opt-in limit.
+            // Fall through to the HDIM 256 kernel instead.
+        #if !defined(FLASH_SM70_NO_HDIM512)
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_fp8_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL_FP8(512, 256, smem);
+        #else
+            smem = 0;
+            LAUNCH_PREFILL_FP8(256, 128, smem);
+        #endif
         }
 #undef LAUNCH_PREFILL_FP8
 #undef HALF
@@ -1163,11 +1203,19 @@ extern "C" void call_flash_tq4_prefill(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(256, 128, smem);
         } else {
+            // HDIM 512 is not compiled on Volta: it needs 101120 B of
+            // dynamic shared memory, more than SM70's 64 KB opt-in limit.
+            // Fall through to the HDIM 256 kernel instead.
+        #if !defined(FLASH_SM70_NO_HDIM512)
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq4_prefill_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(512, 256, smem);
+        #else
+            smem = 0;
+            LAUNCH_PREFILL(256, 128, smem);
+        #endif
         }
 #undef LAUNCH_PREFILL
 #undef HALF
@@ -1200,11 +1248,19 @@ extern "C" void call_flash_tq4_prefill(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(256, 128, smem);
         } else {
+            // HDIM 512 is not compiled on Volta: it needs 101120 B of
+            // dynamic shared memory, more than SM70's 64 KB opt-in limit.
+            // Fall through to the HDIM 256 kernel instead.
+        #if !defined(FLASH_SM70_NO_HDIM512)
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq4_prefill_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(512, 256, smem);
+        #else
+            smem = 0;
+            LAUNCH_PREFILL(256, 128, smem);
+        #endif
         }
 #undef LAUNCH_PREFILL
 #undef HALF
@@ -1412,11 +1468,19 @@ extern "C" void call_flash_tq3_prefill(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(256, 128, smem);
         } else {
+            // HDIM 512 is not compiled on Volta: it needs 101120 B of
+            // dynamic shared memory, more than SM70's 64 KB opt-in limit.
+            // Fall through to the HDIM 256 kernel instead.
+        #if !defined(FLASH_SM70_NO_HDIM512)
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq3_prefill_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(512, 256, smem);
+        #else
+            smem = 0;
+            LAUNCH_PREFILL(256, 128, smem);
+        #endif
         }
 #undef LAUNCH_PREFILL
 #undef HALF
@@ -1451,11 +1515,19 @@ extern "C" void call_flash_tq3_prefill(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(256, 128, smem);
         } else {
+            // HDIM 512 is not compiled on Volta: it needs 101120 B of
+            // dynamic shared memory, more than SM70's 64 KB opt-in limit.
+            // Fall through to the HDIM 256 kernel instead.
+        #if !defined(FLASH_SM70_NO_HDIM512)
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq3_prefill_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(512, 256, smem);
+        #else
+            smem = 0;
+            LAUNCH_PREFILL(256, 128, smem);
+        #endif
         }
 #undef LAUNCH_PREFILL
 #undef HALF
