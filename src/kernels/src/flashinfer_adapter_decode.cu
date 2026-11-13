@@ -131,6 +131,76 @@ void flashinfer_append_kv_cache(
 #endif
 }
 
+// Query how many bytes the decode plan needs.
+//
+// The plan carves a handful of small arrays out of the int workspace: the
+// request indices, the kv tile indices, the output indptr, the kv chunk
+// size and -- when the kv cache is split -- a block validity mask.  Every
+// one of them scales with the *padded* batch size, not with the model, so
+// the fixed 128 MiB that used to be reserved was almost entirely wasted.
+//
+// FlashInfer offers a variant of the plan that only computes the sizes, so
+// the caller can allocate exactly what is needed.
+size_t flashinfer_decode_plan_workspace_size(
+    int32_t* indptr_host,
+    int32_t* kv_len_arr_host,
+    int32_t batch_size,
+    int32_t num_qo_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t page_size,
+    bool enable_cuda_graph,
+    int32_t data_type,
+    int64_t* sizes_out
+) {
+#ifdef USE_FLASHINFER
+    if (num_kv_heads <= 0 || num_qo_heads <= 0 || (num_qo_heads % num_kv_heads) != 0) {
+        return 0;
+    }
+    uint32_t group_size = static_cast<uint32_t>(num_qo_heads / num_kv_heads);
+    if (!IsSupportedDecodeGroupSize(group_size)) {
+        return 0;
+    }
+    if (!IsSupportedDecodeHeadDimForGroupSize(group_size, static_cast<uint32_t>(head_dim))) {
+        return 0;
+    }
+    size_t float_size = 0;
+    size_t int_size = 0;
+    auto run_size = [&](auto dtype_kv_val) {
+        using DTypeKV = decltype(dtype_kv_val);
+        using DTypeQ = DTypeKV;
+        using DTypeOut = DTypeKV;
+        using IdType = int32_t;
+
+        DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+            DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, {
+                using AttentionType = DefaultDecodeAttention;
+                using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
+
+                DecodePlanWorkspaceSize<HEAD_DIM, PosEncodingMode::kNone, AttentionType, ParamsType>(
+                    float_size, int_size,
+                    indptr_host, batch_size, num_qo_heads, page_size, enable_cuda_graph, 0,
+                    BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
+                        GROUP_SIZE, HEAD_DIM, PosEncodingMode::kNone,
+                        AttentionType, ParamsType>
+                );
+            });
+        });
+    };
+    run_size(half{});
+    if (sizes_out != nullptr) {
+        sizes_out[0] = static_cast<int64_t>(float_size);
+        sizes_out[1] = static_cast<int64_t>(int_size);
+    }
+    return static_cast<size_t>(int_size);
+#else
+    (void)indptr_host; (void)kv_len_arr_host; (void)batch_size; (void)num_qo_heads;
+    (void)num_kv_heads; (void)head_dim; (void)page_size; (void)enable_cuda_graph;
+    (void)data_type; (void)sizes_out;
+    return 0;
+#endif
+}
+
 void flashinfer_decode_plan_wrapper(
     int32_t* indptr_host,
     int32_t* qo_indptr_host,
@@ -210,6 +280,11 @@ void flashinfer_decode_plan_wrapper(
                         plan_info_out[7] = plan_info.kv_chunk_size_ptr_offset;
                         plan_info_out[8] = plan_info.enable_cuda_graph;
                         plan_info_out[9] = plan_info.split_kv;
+                        // The number of bytes the plan actually carved out of
+                        // the int workspace.  The caller uses it to size the
+                        // allocation, so the buffer does not have to be a
+                        // fixed 128 MiB.
+                        plan_info_out[10] = static_cast<int64_t>(int_workspace_size_out);
                     }
                 });
             });
@@ -235,6 +310,8 @@ void flashinfer_decode_plan_wrapper(
                 using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
                 DecodePlanInfo plan_info;
+                size_t int_workspace_size_out = 0;
+                size_t float_workspace_size_out = 0;
                 DecodePlan<HEAD_DIM, PosEncodingMode::kNone, AttentionType, ParamsType>(
                     workspace_float, workspace_float_size,
                     workspace_int, page_locked_int_buffer, workspace_int_size,
@@ -256,6 +333,7 @@ void flashinfer_decode_plan_wrapper(
                     plan_info_out[7] = plan_info.kv_chunk_size_ptr_offset;
                     plan_info_out[8] = plan_info.enable_cuda_graph;
                     plan_info_out[9] = plan_info.split_kv;
+                    plan_info_out[10] = static_cast<int64_t>(int_workspace_size_out);
                 }
                 // Diagnostic: the plan values decide the launch geometry, and
                 // an empty grid is the only way the launch fails with

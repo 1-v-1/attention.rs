@@ -748,6 +748,37 @@ pub fn decode_plan(
     };
 
     let sm = cuda_utils::sm_version(dev).unwrap_or(0);
+
+    // Ask the plan how much it needs before touching the workspace: the int
+    // workspace holds a few index arrays whose size is driven by the padded
+    // batch size, so it can be much smaller than the 128 MiB upper bound.
+    // The buffer grows on demand, which keeps the reservation for a 27B
+    // model on a 16 GB card small.
+    {
+        let indptr_i32 = indptr_host
+            .iter()
+            .map(|v| *v as i32)
+            .collect::<Vec<i32>>();
+        let mut sizes = [0i64; 2];
+        let needed = unsafe {
+            kernels::ffi::flashinfer_decode_plan_workspace_size(
+                indptr_i32.as_ptr(),
+                std::ptr::null(),
+                batch_size as i32,
+                num_qo_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                page_size as i32,
+                enable_cuda_graph,
+                data_type,
+                sizes.as_mut_ptr(),
+            )
+        };
+        if needed > 0 {
+            workspace::ensure_int_capacity(dev, enable_cuda_graph, needed)?;
+        }
+    }
+
     let (ws_float_ptr, ws_float_size, ws_int_ptr, ws_int_size, page_locked_ptr, page_locked_size) =
         get_plan_workspace(dev, enable_cuda_graph)?;
 

@@ -1428,6 +1428,21 @@ extern "C" {
     );
 
     #[cfg(feature = "flashinfer")]
+    /// Query the byte counts the decode plan needs for its float and int
+    /// workspaces.  `sizes_out` receives `[float_bytes, int_bytes]`.
+    pub fn flashinfer_decode_plan_workspace_size(
+        indptr_host: *const i32,
+        kv_len_arr_host: *const i32,
+        batch_size: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        enable_cuda_graph: bool,
+        data_type: i32,
+        sizes_out: *mut i64,
+    ) -> usize;
+
     pub fn flashinfer_decode_plan_wrapper(
         indptr_host: *const i32,     // Host pointer for planning
         qo_indptr_host: *const i32,  // Host pointer for fp8 decode plan

@@ -73,7 +73,18 @@ pub const GEMM_SCRATCH_FLOAT_SIZE: usize = 0;
 pub const WORKSPACE_FLOAT_SIZE: usize = FLASHINFER_PLAN_FLOAT_SIZE + GEMM_SCRATCH_FLOAT_SIZE;
 
 /// Size of the int workspace buffer (128 MiB).
+///
+/// This is the upper bound.  The buffer is allocated lazily at
+/// [`WORKSPACE_INT_INITIAL_SIZE`] and grows to what the decode plan asks
+/// for, so the 128 MiB is a cap rather than an allocation.
 pub const WORKSPACE_INT_SIZE: usize = 128 * 1024 * 1024;
+
+/// The size the int workspace starts at.
+///
+/// The decode plan carves five small index arrays out of it.  Their size is
+/// driven by the padded batch size, so a few hundred kilobytes cover every
+/// batch a 16 GB card can hold; the buffer grows on demand afterwards.
+pub const WORKSPACE_INT_INITIAL_SIZE: usize = 4 * 1024 * 1024;
 
 /// Size of the reduced float buffer used by the eager workspace on Volta.
 ///
@@ -123,7 +134,7 @@ pub const WORKSPACE_REGIONS: WorkspaceRegions = WorkspaceRegions {
 /// is allocated lazily on first use, so a caller that plans its allocations
 /// around the free memory has to know the size up front.
 pub fn workspace_gpu_bytes() -> usize {
-    WORKSPACE_FLOAT_SIZE + WORKSPACE_INT_SIZE
+    WORKSPACE_FLOAT_SIZE + WORKSPACE_INT_INITIAL_SIZE
 }
 
 /// The device memory the reduced eager workspace occupies on Volta.
@@ -131,7 +142,7 @@ pub fn workspace_gpu_bytes() -> usize {
 /// The eager slot keeps the int buffer and the page-locked host buffer, and
 /// only the float buffer is reduced.
 pub fn sm70_eager_workspace_gpu_bytes() -> usize {
-    SM70_EAGER_FLOAT_SIZE + WORKSPACE_INT_SIZE
+    SM70_EAGER_FLOAT_SIZE + WORKSPACE_INT_INITIAL_SIZE
 }
 
 /// Returns the workspace regions after validating they don't overlap.
@@ -229,6 +240,12 @@ mod cuda {
         /// Size of the float buffer, which is smaller than the region table
         /// on Volta.
         pub float_size: usize,
+        /// Size of the int buffer.
+        ///
+        /// The decode plan carves a few small arrays out of it, so the
+        /// buffer is sized to what the plan actually needs instead of a
+        /// fixed 128 MiB.
+        pub int_size: usize,
     }
 
     /// Dedicated CUTLASS workspace, kept separate from FlashInfer buffers.
@@ -337,6 +354,13 @@ mod cuda {
                 WORKSPACE_FLOAT_SIZE
             };
 
+            // The int buffer holds a handful of index arrays whose size is
+            // driven by the padded batch size, not by the model.  It starts
+            // small and grows on demand, so a 27B model on a 16 GB card does
+            // not have to reserve 128 MiB per card for a few kilobytes of
+            // indices.
+            let int_size = WORKSPACE_INT_INITIAL_SIZE;
+
             let needs_init = match ws.as_ref() {
                 None => true,
                 Some(existing) => existing.device_ordinal != ordinal,
@@ -344,14 +368,15 @@ mod cuda {
 
             if needs_init {
                 let float_buffer = unsafe { dev.alloc::<u8>(float_size.max(1)) }.w()?;
-                let int_buffer = unsafe { dev.alloc::<u8>(WORKSPACE_INT_SIZE) }.w()?;
-                let pinned_host = PinnedHostBuffer::new(WORKSPACE_INT_SIZE)?;
+                let int_buffer = unsafe { dev.alloc::<u8>(int_size.max(1)) }.w()?;
+                let pinned_host = PinnedHostBuffer::new(int_size)?;
                 *ws = Some(FlashInferWorkspace {
                     float_buffer,
                     int_buffer,
                     pinned_host,
                     device_ordinal: ordinal,
                     float_size,
+                    int_size,
                 });
             }
 
@@ -390,6 +415,55 @@ mod cuda {
 
     /// Returns workspace pointers for FlashInfer plan operations.
     ///
+    /// Grows the int buffer of a workspace slot to at least `needed` bytes.
+    ///
+    /// The decode plan reports how many bytes it carved out of the int
+    /// workspace.  The buffer is only reallocated when the plan asks for
+    /// more than the slot currently holds, so the common case costs
+    /// nothing.
+    pub fn ensure_int_capacity(
+        dev: &candle_core::cuda_backend::CudaDevice,
+        for_cuda_graph: bool,
+        needed: usize,
+    ) -> Result<()> {
+        let ws_cell = if for_cuda_graph {
+            &WORKSPACE_GRAPH
+        } else {
+            &WORKSPACE
+        };
+        ws_cell.with(|ws| {
+            let mut ws = ws.borrow_mut();
+            let current = match ws.as_ref() {
+                Some(existing) if existing.device_ordinal == dev.ordinal() => existing.int_size,
+                _ => 0,
+            };
+            if needed <= current {
+                return Ok(());
+            }
+            // Round up to a power of two so that a plan that grows a little
+            // does not reallocate on every call.
+            let mut target = WORKSPACE_INT_INITIAL_SIZE.max(1);
+            while target < needed {
+                target *= 2;
+            }
+            let int_buffer = unsafe { dev.alloc::<u8>(target) }.w()?;
+            let pinned_host = PinnedHostBuffer::new(target)?;
+            let ordinal = dev.ordinal();
+            *ws = Some(FlashInferWorkspace {
+                float_buffer: ws
+                    .as_ref()
+                    .map(|w| w.float_buffer.clone())
+                    .ok_or_else(|| candle_core::Error::msg("workspace has no float buffer"))?,
+                int_buffer,
+                pinned_host,
+                device_ordinal: ordinal,
+                float_size: ws.as_ref().map(|w| w.float_size).unwrap_or(0),
+                int_size: target,
+            });
+            Ok(())
+        })
+    }
+
     /// Returns (float_ptr, float_size, int_ptr, int_size, page_locked_ptr, page_locked_size).
     #[cfg(feature = "flashinfer")]
     pub fn get_plan_workspace(
@@ -413,11 +487,29 @@ mod cuda {
         } else {
             float_buffer_size(dev, for_cuda_graph)
         };
+        // The int region is sized to what the buffer actually holds, not to
+        // the 128 MiB upper bound: FlashInfer uses the size as the capacity
+        // it may carve out of, and a smaller number means a smaller
+        // allocation.
+        let int_size = {
+            let ws_cell = if for_cuda_graph {
+                &WORKSPACE_GRAPH
+            } else {
+                &WORKSPACE
+            };
+            ws_cell.with(|ws| {
+                let ws = ws.borrow();
+                match ws.as_ref() {
+                    Some(existing) if existing.device_ordinal == dev.ordinal() => existing.int_size,
+                    _ => 0,
+                }
+            })
+        };
         Ok((
             add_workspace_offset(float_ptr, regions.plan_float),
             float_size,
             add_workspace_offset(int_ptr, regions.plan_int),
-            regions.plan_int.size,
+            int_size,
             page_locked_ptr,
             page_locked_size,
         ))
