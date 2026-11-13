@@ -312,8 +312,18 @@ mod cuda {
             // buffer, and only the float buffer is left out on Volta.  That
             // saves 256 MiB per card, which on a 27B model on a 16 GB card is
             // the difference between having a KV cache and having none.
+            // The CUDA-graph slot has the same problem: the FlashInfer
+            // prefill kernels need SM80, so the prefill plan never runs on
+            // Volta and the graph slot's float buffer is only touched by
+            // that plan.  The decode plan uses the int buffer and the
+            // page-locked host buffer, which are kept in both slots.
+            //
+            // Leaving the 256 MiB float buffer out of the graph slot as
+            // well saves another 248 MiB per card.  On a 27B model on a
+            // 16 GB card that is the difference between a usable KV cache
+            // and a tiny one.
             let skip_float_buffer =
-                !for_cuda_graph && crate::cuda_utils::sm_version(dev) == Some(70);
+                crate::cuda_utils::sm_version(dev) == Some(70);
             // The decode plan still asks the float buffer for scratch when it
             // splits the KV cache over several chunks, so the reduced buffer
             // has to be big enough for that.  The split path needs
