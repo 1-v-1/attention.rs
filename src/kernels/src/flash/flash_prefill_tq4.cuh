@@ -49,6 +49,27 @@
 #define TQ4P_BC 32
 #define TQ4P_HDIM FLASH_HDIM
 
+// Number of shared-memory buffers used to stage the K tile.
+//
+// SM80+ has a 164 KB opt-in shared-memory budget per block, so the K tile is
+// double-buffered: K[i+1] is prefetched while the PV MMA for K[i] is running.
+//
+// SM70/SM75 only allow 64 KB.  At head_dim 256 the double-buffered layout
+// needs 70400 B (68.75 KB), which does not fit, so
+// `cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize)`
+// fails and the launch dies.  The failure is asynchronous: the CUDA context
+// is left in an error state and the *next* CUDA call reports it.  Under
+// tensor parallelism that next call is typically the NCCL collective, so the
+// user sees `ncclUnhandledCudaError(1)` instead of the real cause.
+//
+// With a single K buffer the layout needs 52224 B (51 KB), which fits SM70.
+// The cost is that the K prefetch can no longer overlap the PV MMA.
+#ifdef NO_BF16_KERNEL
+#define TQ4P_K_BUFFERS 1
+#else
+#define TQ4P_K_BUFFERS 2
+#endif
+
 #if TQ4P_HDIM <= 256
 #define TQ4P_PAD_KV 8
 #else
@@ -164,13 +185,13 @@ flash_tq4_prefill(
     extern __shared__ __align__(16) unsigned char tq4p_smem_dyn[];
     HalfT* smem_Q = reinterpret_cast<HalfT*>(tq4p_smem_dyn);
     HalfT* smem_K_flat = smem_Q + TQ4P_BR * TQ4P_HDIM_PAD;
-    HalfT* smem_V = smem_K_flat + 2 * TQ4P_BC * TQ4P_HDIM_PAD;
+    HalfT* smem_V = smem_K_flat + TQ4P_K_BUFFERS * TQ4P_BC * TQ4P_HDIM_PAD;
     HalfT* smem_P = smem_V + TQ4P_BC * TQ4P_HDIM_PAD;
     float* smem_ml = reinterpret_cast<float*>(smem_P + TQ4P_BR * (TQ4P_BC + TQ4P_PAD_P));
     #define SMEM_K_TQ4P(buf, idx) smem_K_flat[(buf) * TQ4P_BC * TQ4P_HDIM_PAD + (idx)]
 #else
     __shared__ HalfT smem_Q[TQ4P_BR * TQ4P_HDIM_PAD];
-    __shared__ HalfT smem_K_arr[2][TQ4P_BC * TQ4P_HDIM_PAD];
+    __shared__ HalfT smem_K_arr[TQ4P_K_BUFFERS][TQ4P_BC * TQ4P_HDIM_PAD];
     __shared__ HalfT smem_V[TQ4P_BC * TQ4P_HDIM_PAD];
     __shared__ HalfT smem_P[TQ4P_BR * (TQ4P_BC + TQ4P_PAD_P)];
     __shared__ float smem_ml[TQ4P_BR * 2];
@@ -257,7 +278,12 @@ flash_tq4_prefill(
         unsigned int kv_start = kv_block * TQ4P_BC;
         unsigned int kv_end = min(kv_start + TQ4P_BC, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
+#if TQ4P_K_BUFFERS == 1
+        // Single K buffer: the same buffer is reused for every KV block.
+        unsigned int buf = 0;
+#else
         unsigned int buf = kv_block & 1;
+#endif
 
         // Load V from TQ4 (overlaps with QK^T conceptually, but no cp.async)
         LOAD_TQ4_KV_TILE(V_absmax, V_quant, block_table, smem_V, kv_start, kv_len, kv_head, tid, TQ4P_NUM_THREADS);
@@ -394,10 +420,22 @@ flash_tq4_prefill(
         l_r1 += smem_ml[row1 * 2] + smem_ml[row1 * 2 + 1];
 
         // Preload K[i+1] from TQ4
+        //
+        // With two K buffers this lands in the *other* buffer and overlaps
+        // with the PV MMA below.  With a single K buffer (SM70, where the
+        // double-buffered layout does not fit in 64 KB) the prefetch would
+        // overwrite the K tile that the QK^T above just consumed -- that is
+        // fine, because QK^T is already done -- but it must not race with
+        // the PV MMA, which still reads the current K tile.  So the single
+        // buffer case defers the prefetch to the end of the loop body.
+#if TQ4P_K_BUFFERS == 1
+        // (deferred: see below)
+#else
         if (kv_block + 1 < num_kv_blocks) {
             LOAD_TQ4_KV_TILE(K_absmax, K_quant, block_table, (&SMEM_K_TQ4P(1 - buf, 0)),
                 (kv_block + 1) * TQ4P_BC, kv_len, kv_head, tid, TQ4P_NUM_THREADS);
         }
+#endif
 
         // PV MMA (all 4 warps)
         {
@@ -428,6 +466,19 @@ flash_tq4_prefill(
         }
 
         __syncthreads();
+
+#if TQ4P_K_BUFFERS == 1
+        // Single K buffer: stage K[i+1] into the (now free) K tile.
+        //
+        // The __syncthreads() above guarantees every warp has finished reading
+        // the current K tile in the PV MMA, so overwriting it here is safe.
+        // The next iteration's QK^T is separated from this load by the
+        // __syncthreads() that follows the V load.
+        if (kv_block + 1 < num_kv_blocks) {
+            LOAD_TQ4_KV_TILE(K_absmax, K_quant, block_table, (&SMEM_K_TQ4P(0, 0)),
+                (kv_block + 1) * TQ4P_BC, kv_len, kv_head, tid, TQ4P_NUM_THREADS);
+        }
+#endif
     }
 
     // Final normalization and store

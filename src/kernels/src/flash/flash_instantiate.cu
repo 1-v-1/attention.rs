@@ -432,7 +432,15 @@ extern "C" void call_flash_prefill_paged(
         if (head_dim <= 128) {
             LAUNCH_PREFILL(128, 128, 0);
         } else if (head_dim <= 256) {
-            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            // SM70/SM75 cap the opt-in dynamic shared-memory allocation at
+            // 64 KB; the double-buffered layout needs 70400 B.  PAGED_K_BUFFERS
+            // is 1 there, which brings the requirement down to 52224 B.
+#ifdef NO_BF16_KERNEL
+            const unsigned int paged_k_buffers = 1;
+#else
+            const unsigned int paged_k_buffers = 2;
+#endif
+            unsigned int smem = (32*264 + paged_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_256<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
@@ -461,7 +469,15 @@ extern "C" void call_flash_prefill_paged(
         if (head_dim <= 128) {
             LAUNCH_PREFILL(128, 128, 0);
         } else if (head_dim <= 256) {
-            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            // SM70/SM75 cap the opt-in dynamic shared-memory allocation at
+            // 64 KB; the double-buffered layout needs 70400 B.  PAGED_K_BUFFERS
+            // is 1 there, which brings the requirement down to 52224 B.
+#ifdef NO_BF16_KERNEL
+            const unsigned int paged_k_buffers = 1;
+#else
+            const unsigned int paged_k_buffers = 2;
+#endif
+            unsigned int smem = (32*264 + paged_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_256<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
@@ -509,7 +525,15 @@ extern "C" void call_flash_prefill_paged_fp8(
         if (head_dim <= 128) {
             LAUNCH_PREFILL_FP8(128, 128, 0);
         } else if (head_dim <= 256) {
-            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            // SM70/SM75 cap the opt-in dynamic shared-memory allocation at
+            // 64 KB; the double-buffered layout needs 70400 B.  FP8_K_BUFFERS
+            // is 1 there, which brings the requirement down to 52224 B.
+#ifdef NO_BF16_KERNEL
+            const unsigned int fp8_k_buffers = 1;
+#else
+            const unsigned int fp8_k_buffers = 2;
+#endif
+            unsigned int smem = (32*264 + fp8_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_fp8_256<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
@@ -539,7 +563,15 @@ extern "C" void call_flash_prefill_paged_fp8(
         if (head_dim <= 128) {
             LAUNCH_PREFILL_FP8(128, 128, 0);
         } else if (head_dim <= 256) {
-            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            // SM70/SM75 cap the opt-in dynamic shared-memory allocation at
+            // 64 KB; the double-buffered layout needs 70400 B.  FP8_K_BUFFERS
+            // is 1 there, which brings the requirement down to 52224 B.
+#ifdef NO_BF16_KERNEL
+            const unsigned int fp8_k_buffers = 1;
+#else
+            const unsigned int fp8_k_buffers = 2;
+#endif
+            unsigned int smem = (32*264 + fp8_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_fp8_256<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
@@ -1107,7 +1139,25 @@ extern "C" void call_flash_tq4_prefill(
         if (head_dim <= 128) {
             LAUNCH_PREFILL(128, 128, 0);
         } else if (head_dim <= 256) {
-            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            // Shared-memory layout of flash_tq4_prefill_256:
+            //   smem_Q   : BR * HDIM_PAD          (264)
+            //   smem_K   : K_BUFFERS * BC * HDIM_PAD
+            //   smem_V   : BC * HDIM_PAD
+            //   smem_P   : BR * (BC + PAD_P)      (32 * 40)
+            //   smem_ml  : BR * 2 floats
+            //
+            // SM70/SM75 only allow a 64 KB opt-in dynamic shared-memory
+            // allocation.  With two K buffers this needs 70400 B, so
+            // cudaFuncSetAttribute() fails and the launch dies with an
+            // asynchronous CUDA error that surfaces at the next NCCL
+            // collective.  TQ4P_K_BUFFERS is 1 on those architectures, which
+            // brings the requirement down to 52224 B.
+#ifdef NO_BF16_KERNEL
+            const unsigned int k_buffers = 1;
+#else
+            const unsigned int k_buffers = 2;
+#endif
+            unsigned int smem = (32*264 + k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq4_prefill_256<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
@@ -1138,7 +1188,13 @@ extern "C" void call_flash_tq4_prefill(
         if (head_dim <= 128) {
             LAUNCH_PREFILL(128, 128, 0);
         } else if (head_dim <= 256) {
-            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            // See the F16 branch above: SM70/SM75 need a single K buffer.
+#ifdef NO_BF16_KERNEL
+            const unsigned int k_buffers = 1;
+#else
+            const unsigned int k_buffers = 2;
+#endif
+            unsigned int smem = (32*264 + k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq4_prefill_256<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
@@ -1342,7 +1398,15 @@ extern "C" void call_flash_tq3_prefill(
         if (head_dim <= 128) {
             LAUNCH_PREFILL(128, 128, 0);
         } else if (head_dim <= 256) {
-            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            // SM70/SM75 cap the opt-in dynamic shared-memory allocation at
+            // 64 KB; the double-buffered layout needs 70400 B.  TQ3P_K_BUFFERS
+            // is 1 there, which brings the requirement down to 52224 B.
+#ifdef NO_BF16_KERNEL
+            const unsigned int tq3_k_buffers = 1;
+#else
+            const unsigned int tq3_k_buffers = 2;
+#endif
+            unsigned int smem = (32*264 + tq3_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq3_prefill_256<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
@@ -1373,7 +1437,15 @@ extern "C" void call_flash_tq3_prefill(
         if (head_dim <= 128) {
             LAUNCH_PREFILL(128, 128, 0);
         } else if (head_dim <= 256) {
-            unsigned int smem = (32*264 + 2*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            // SM70/SM75 cap the opt-in dynamic shared-memory allocation at
+            // 64 KB; the double-buffered layout needs 70400 B.  TQ3P_K_BUFFERS
+            // is 1 there, which brings the requirement down to 52224 B.
+#ifdef NO_BF16_KERNEL
+            const unsigned int tq3_k_buffers = 1;
+#else
+            const unsigned int tq3_k_buffers = 2;
+#endif
+            unsigned int smem = (32*264 + tq3_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq3_prefill_256<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);

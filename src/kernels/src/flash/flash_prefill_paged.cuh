@@ -65,6 +65,20 @@
 #define TILE_CHUNKS (BR * (HDIM / 8))
 #define NUM_THREADS 128
 
+// Number of shared-memory buffers used to stage the K tile.
+//
+// SM70/SM75 only allow a 64 KB opt-in dynamic shared-memory allocation.  At
+// head_dim 256 the double-buffered layout needs 70400 B, so
+// cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize) fails
+// and the launch dies with an asynchronous CUDA error that surfaces at the
+// next NCCL collective.  A single K buffer brings the requirement down to
+// 52224 B, at the cost of the K prefetch no longer overlapping the PV MMA.
+#ifdef NO_BF16_KERNEL
+#define PAGED_K_BUFFERS 1
+#else
+#define PAGED_K_BUFFERS 2
+#endif
+
 // Paged KV tile loader: cp.async from scattered pages to contiguous smem.
 // block_size is always power-of-2 in practice; __ffs gives bit position for shift.
 #define LOAD_KV_TILE_BF16(cache, bt, smem, kv_s, kv_l, kvh, t, stride) \
@@ -169,13 +183,13 @@ flash_prefill_paged(
     extern __shared__ __align__(16) unsigned char prefill_smem_dyn[];
     HalfT* smem_Q = reinterpret_cast<HalfT*>(prefill_smem_dyn);
     HalfT* smem_K_flat = smem_Q + BR * HDIM_PAD;
-    HalfT* smem_V = smem_K_flat + 2 * BC * HDIM_PAD;
+    HalfT* smem_V = smem_K_flat + PAGED_K_BUFFERS * BC * HDIM_PAD;
     HalfT* smem_P = smem_V + BC * HDIM_PAD;
     float* smem_ml = reinterpret_cast<float*>(smem_P + BR * (BC + PAD_P));
     #define SMEM_K_PAGED(buf, idx) smem_K_flat[(buf) * BC * HDIM_PAD + (idx)]
 #else
     __shared__ HalfT smem_Q[BR * HDIM_PAD];
-    __shared__ HalfT smem_K_arr[2][BC * HDIM_PAD];
+    __shared__ HalfT smem_K_arr[PAGED_K_BUFFERS][BC * HDIM_PAD];
     __shared__ HalfT smem_V[BC * HDIM_PAD];
     __shared__ HalfT smem_P[BR * (BC + PAD_P)];
     __shared__ float smem_ml[BR * 2];
@@ -228,10 +242,12 @@ flash_prefill_paged(
             LOAD_KV_TILE_BF16(K_cache, block_table, (&SMEM_K_PAGED(0, 0)), kv_block_start * BC, kv_len, kv_head, tid, NUM_THREADS);
         }
         FLASH_ASYNC_COMMIT(); // group 0: Q + K[0]
+#if PAGED_K_BUFFERS == 2
         if (kv_block_start + 1 < num_kv_blocks) {
             LOAD_KV_TILE_BF16(K_cache, block_table, (&SMEM_K_PAGED(1, 0)), (kv_block_start + 1) * BC, kv_len, kv_head, tid, NUM_THREADS);
             FLASH_ASYNC_COMMIT(); // group 1: K[1]
         }
+#endif
         FLASH_ASYNC_WAIT();
     }
     __syncthreads();
@@ -240,7 +256,12 @@ flash_prefill_paged(
         unsigned int kv_start = kv_block * BC;
         unsigned int kv_end = min(kv_start + BC, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
+#if PAGED_K_BUFFERS == 1
+        // Single K buffer: the same buffer is reused for every KV block.
+        unsigned int buf = 0;
+#else
         unsigned int buf = kv_block & 1;
+#endif
 
         // Async V load (overlaps with QK^T)
         LOAD_KV_TILE_BF16(V_cache, block_table, smem_V, kv_start, kv_len, kv_head, tid, NUM_THREADS);
@@ -395,11 +416,21 @@ flash_prefill_paged(
         __syncthreads();
 
         // Preload K[i+2] into the next-next buffer (overlaps with PV compute)
+        //
+        // With two K buffers this lands in the buffer that is two blocks
+        // ahead and overlaps with the PV MMA below.  With a single K buffer
+        // (SM70, where the double-buffered layout does not fit in 64 KB) the
+        // prefetch would overwrite the K tile the QK^T above consumed --
+        // harmless -- but it must not race with the PV MMA, which still reads
+        // the current K tile.  So the single-buffer case defers the prefetch
+        // to the end of the loop body.
+#if PAGED_K_BUFFERS == 2
         if (kv_block + 2 < num_kv_blocks) {
             LOAD_KV_TILE_BF16(K_cache, block_table, (&SMEM_K_PAGED(kv_block & 1, 0)),
                 (kv_block + 2) * BC, kv_len, kv_head, tid, NUM_THREADS);
             FLASH_ASYNC_COMMIT();
         }
+#endif
 
         // PV MMA (all 4 warps)
         {
@@ -433,6 +464,20 @@ flash_prefill_paged(
             FLASH_ASYNC_WAIT();
         }
         __syncthreads();
+
+#if PAGED_K_BUFFERS == 1
+        // Single K buffer: stage K[i+1] into the (now free) K tile.
+        //
+        // The __syncthreads() above guarantees every warp has finished reading
+        // the current K tile in the PV MMA, so overwriting it here is safe.
+        // The next iteration's QK^T is separated from this load by the
+        // __syncthreads() that follows the V load.
+        if (kv_block + 1 < num_kv_blocks) {
+            LOAD_KV_TILE_BF16(K_cache, block_table, (&SMEM_K_PAGED(0, 0)),
+                (kv_block + 1) * BC, kv_len, kv_head, tid, NUM_THREADS);
+            FLASH_ASYNC_COMMIT();
+        }
+#endif
     }
 
     // Final normalization and store

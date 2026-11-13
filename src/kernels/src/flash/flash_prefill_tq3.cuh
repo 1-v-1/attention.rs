@@ -43,6 +43,20 @@
 
 #define TQ3P_HDIM_PAD (TQ3P_HDIM + TQ3P_PAD_KV)
 #define TQ3P_PAD_P 8
+
+// Number of shared-memory buffers used to stage the K tile.
+//
+// SM70/SM75 only allow a 64 KB opt-in dynamic shared-memory allocation.  At
+// head_dim 256 the double-buffered layout needs 70400 B, so
+// cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize) fails
+// and the launch dies with an asynchronous CUDA error that surfaces at the
+// next NCCL collective.  A single K buffer brings the requirement down to
+// 52224 B, at the cost of the K prefetch no longer overlapping the PV MMA.
+#ifdef NO_BF16_KERNEL
+#define TQ3P_K_BUFFERS 1
+#else
+#define TQ3P_K_BUFFERS 2
+#endif
 #define TQ3P_N_TILES_PER_WARP ((TQ3P_HDIM / 8) / 2)
 #define TQ3P_TILE_CHUNKS (TQ3P_BR * (TQ3P_HDIM / 8))
 #define TQ3P_NUM_THREADS 128
@@ -194,13 +208,13 @@ flash_tq3_prefill(
     extern __shared__ __align__(16) unsigned char tq3p_smem_dyn[];
     HalfT* smem_Q = reinterpret_cast<HalfT*>(tq3p_smem_dyn);
     HalfT* smem_K_flat = smem_Q + TQ3P_BR * TQ3P_HDIM_PAD;
-    HalfT* smem_V = smem_K_flat + 2 * TQ3P_BC * TQ3P_HDIM_PAD;
+    HalfT* smem_V = smem_K_flat + TQ3P_K_BUFFERS * TQ3P_BC * TQ3P_HDIM_PAD;
     HalfT* smem_P = smem_V + TQ3P_BC * TQ3P_HDIM_PAD;
     float* smem_ml = reinterpret_cast<float*>(smem_P + TQ3P_BR * (TQ3P_BC + TQ3P_PAD_P));
     #define SMEM_K_TQ3P(buf, idx) smem_K_flat[(buf) * TQ3P_BC * TQ3P_HDIM_PAD + (idx)]
 #else
     __shared__ HalfT smem_Q[TQ3P_BR * TQ3P_HDIM_PAD];
-    __shared__ HalfT smem_K_arr[2][TQ3P_BC * TQ3P_HDIM_PAD];
+    __shared__ HalfT smem_K_arr[TQ3P_K_BUFFERS][TQ3P_BC * TQ3P_HDIM_PAD];
     __shared__ HalfT smem_V[TQ3P_BC * TQ3P_HDIM_PAD];
     __shared__ HalfT smem_P[TQ3P_BR * (TQ3P_BC + TQ3P_PAD_P)];
     __shared__ float smem_ml[TQ3P_BR * 2];
@@ -286,7 +300,12 @@ flash_tq3_prefill(
         unsigned int kv_start = kv_block * TQ3P_BC;
         unsigned int kv_end = min(kv_start + TQ3P_BC, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
+#if TQ3P_K_BUFFERS == 1
+        // Single K buffer: the same buffer is reused for every KV block.
+        unsigned int buf = 0;
+#else
         unsigned int buf = kv_block & 1;
+#endif
 
         // Load V from 4-bit TQ (same as turbo4)
         LOAD_TQ3_V_TILE(V_absmax, V_quant, block_table, smem_V, kv_start, kv_len, kv_head, tid, TQ3P_NUM_THREADS);
@@ -423,10 +442,22 @@ flash_tq3_prefill(
         l_r1 += smem_ml[row1 * 2] + smem_ml[row1 * 2 + 1];
 
         // Preload K[i+1] from 3-bit TQ
+        //
+        // With two K buffers this lands in the *other* buffer and overlaps
+        // with the PV MMA below.  With a single K buffer (SM70, where the
+        // double-buffered layout does not fit in 64 KB) the prefetch would
+        // overwrite the K tile the QK^T above consumed -- harmless -- but it
+        // must not race with the PV MMA, which still reads the current K
+        // tile.  So the single-buffer case defers the prefetch to the end of
+        // the loop body.
+#if TQ3P_K_BUFFERS == 1
+        // (deferred: see below)
+#else
         if (kv_block + 1 < num_kv_blocks) {
             LOAD_TQ3_K_TILE(K_absmax, K_quant, block_table, (&SMEM_K_TQ3P(1 - buf, 0)),
                 (kv_block + 1) * TQ3P_BC, kv_len, kv_head, tid, TQ3P_NUM_THREADS);
         }
+#endif
 
         // PV MMA (all 4 warps)
         {
@@ -457,6 +488,19 @@ flash_tq3_prefill(
         }
 
         __syncthreads();
+
+#if TQ3P_K_BUFFERS == 1
+        // Single K buffer: stage K[i+1] into the (now free) K tile.
+        //
+        // The __syncthreads() above guarantees every warp has finished reading
+        // the current K tile in the PV MMA, so overwriting it here is safe.
+        // The next iteration's QK^T is separated from this load by the
+        // __syncthreads() that follows the V load.
+        if (kv_block + 1 < num_kv_blocks) {
+            LOAD_TQ3_K_TILE(K_absmax, K_quant, block_table, (&SMEM_K_TQ3P(0, 0)),
+                (kv_block + 1) * TQ3P_BC, kv_len, kv_head, tid, TQ3P_NUM_THREADS);
+        }
+#endif
     }
 
     // Final normalization and store
