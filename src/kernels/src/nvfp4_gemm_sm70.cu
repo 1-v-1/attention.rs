@@ -215,27 +215,35 @@ __global__ void nvfp4_repack_weight_sm70_kernel(
     uint32_t *__restrict__ weight_out, uint32_t *__restrict__ scale_out,
     const float *__restrict__ column_global_scale, float global_scale, int N,
     int K) {
-  // One thread per (n, group of 8 k).
-  const int words_per_row = K / 8;
-  const int total = N * words_per_row;
+  // One thread per (n, 16-element scale group).
+  //
+  // The scale tensor is indexed by the NVFP4 group size (16 elements along
+  // k), not by the weight word (8 elements along k).  Storing one scale per
+  // weight word instead would duplicate every scale twice, which doubles the
+  // scale memory for no reason -- and for a 27B model that is gigabytes.
+  const int scales_per_row = K / 16;
+  const int total = N * scales_per_row;
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= total) return;
 
-  const int n = idx / words_per_row;
-  const int w = idx % words_per_row;
-  const int k0 = w * 8;
+  const int n = idx / scales_per_row;
+  const int group = idx % scales_per_row;
+  const int k0 = group * 16;
 
   // The source is two nibbles per byte with the low nibble at the smaller k,
   // so byte j holds elements 2j (low) and 2j+1 (high).
   const uint8_t *src = weight + (size_t)n * (K / 2) + k0 / 2;
-  uint32_t codes[8];
+  uint32_t codes[16];
 #pragma unroll
-  for (int i = 0; i < 4; ++i) {
+  for (int i = 0; i < 8; ++i) {
     const uint8_t b = src[i];
     codes[2 * i] = b & 0xFu;
     codes[2 * i + 1] = (b >> 4) & 0xFu;
   }
 
+  // Two weight words per 16-element scale group.
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
   // The packed layout keeps one complete four-bit code per nibble, element j
   // in nibble j.  `decode_fp4_e2m1_x8` turns that into
   //
@@ -245,12 +253,11 @@ __global__ void nvfp4_repack_weight_sm70_kernel(
   // b_hi = {w2, w3} covers k = 4..7.
   uint32_t packed = 0;
 #pragma unroll
-  for (int j = 0; j < 8; ++j) packed |= (codes[j] & 0xFu) << (4 * j);
-  weight_out[idx] = packed;
+  for (int j = 0; j < 8; ++j) packed |= (codes[half * 8 + j] & 0xFu) << (4 * j);
+  weight_out[n * (K / 8) + (k0 / 8) + half] = packed;
 
-  // The scale for this word: the group of 8 elements starting at k0 lies
-  // inside the 16-element scale group k0/16.
-  const int group = k0 / SM70_NVFP4_BLOCK_SIZE;
+  }  // half
+
   // The per-tensor global scale is folded in here so that the GEMM kernel
   // only has to multiply by the block scale.  Folding it at repack time
   // keeps it out of the inner loop and costs one multiply per layer.
@@ -266,7 +273,7 @@ __global__ void nvfp4_repack_weight_sm70_kernel(
   uint32_t hb;
   memcpy(&hb, &h, sizeof(h));
   hb &= 0xFFFFu;
-  scale_out[idx] = hb | (hb << 16);
+  scale_out[idx] = hb;
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +371,7 @@ __launch_bounds__(SM70_NVFP4_WARP_SIZE * kWarps) __global__
   }
 
   const int words_per_row = K / 8;   // weight words per output column
-  const int scale_blocks = K / 8;    // repacked scales per output column
+  const int scale_blocks = K / 16;   // repacked scales per output column
   const int n_blocks = K / 8;        // k blocks of eight elements
   const int n_tiles = SM70_NVFP4_CEILDIV(n_blocks, Tile::kWordsPerKBlock);
 
@@ -399,31 +406,62 @@ __launch_bounds__(SM70_NVFP4_WARP_SIZE * kWarps) __global__
       uint4 *dst = reinterpret_cast<uint4 *>(&wdst[c * Tile::kWordsPerKBlock]);
       dst[kbv] = val;
     }
-    // Scales: the repack emits one scale per eight element k block (the
-    // 16 element block scale is duplicated into the two halves of the
-    // block), so the tile holds kTileK/8 of them per column.
+    // Scales: the repack emits one scale per 16-element k group, so a tile
+    // of kTileK elements needs kTileK/16 of them per column.  The shared
+    // tile keeps the historical one-half2-per-word layout (each 8-element
+    // word shares its half with the other word of the same 16-element
+    // group), because `decode_fp4_e2m1_x8` wants the scale broadcast to
+    // both halves of the half2.
+    //
+    // The shared tile holds kTileK/8 half2 scales per column, and the
+    // global tensor holds kTileK/16 scales per column (one per 16
+    // elements).  Each global scale fills two shared entries, so the
+    // shared entry count is twice the global scale count.
+    //
+    // The global read is one uint4 (four uint32 scales, sixteen bytes) per
+    // iteration, which keeps the traffic wide.  A tile of 32 elements has
+    // only two groups per column, so the vector is masked rather than
+    // rounded up.
+    // The global read is one uint4 (four uint32 scales, sixteen bytes) per
+    // iteration, which keeps the traffic wide.  A tile of 32 elements has
+    // only two groups per column, so the vector is masked rather than
+    // rounded up.
     constexpr int kSVec = 4;
-    const int kScalesVec = Tile::kScalesPerTile / kSVec;
-    const int kScalesPerColVec = (kTileK / 8) / kSVec;
+    constexpr int kSGroups = 2;  // shared entries per global scale
+    const int groups_per_col = kTileK / 16;
+    const int vecs_per_col = (groups_per_col + kSVec - 1) / kSVec;
+    const int kScalesVec = Tile::kColumns * vecs_per_col;
     for (int sv = tid; sv < kScalesVec; sv += blockDim.x) {
-      const int c = sv / kScalesPerColVec;
-      const int s = sv % kScalesPerColVec;
+      const int c = sv / vecs_per_col;
+      const int v = sv % vecs_per_col;
       const int gcol = n_base + c;
-      const int gblock = k_tile + s * kSVec;
-      uint4 val = make_uint4(0, 0, 0, 0);
-      if (gcol < N && gblock + kSVec <= scale_blocks) {
-        val = __ldg(reinterpret_cast<const uint4 *>(
-            &weight_scale[(size_t)gcol * scale_blocks + gblock]));
-      } else if (gcol < N && gblock < scale_blocks) {
-        uint4 tmp = make_uint4(0, 0, 0, 0);
-        uint32_t *tp = reinterpret_cast<uint32_t *>(&tmp);
+      // `k_tile` counts weight words (eight elements each); a scale group
+      // covers two words.
+      const int ggroup = k_tile / 2 + v * kSVec;
+      // Each global scale is one uint32 with the half in the low half, so
+      // four of them make one uint4.
+      uint4 raw = make_uint4(0, 0, 0, 0);
+      if (gcol < N && ggroup + kSVec <= scale_blocks) {
+        raw = __ldg(reinterpret_cast<const uint4 *>(
+            &weight_scale[(size_t)gcol * scale_blocks + ggroup]));
+      } else if (gcol < N && ggroup < scale_blocks) {
+        uint32_t *tp = reinterpret_cast<uint32_t *>(&raw);
         for (int j = 0; j < kSVec; ++j)
-          if (gblock + j < scale_blocks)
-            tp[j] = __ldg(&weight_scale[(size_t)gcol * scale_blocks + gblock + j]);
-        val = tmp;
+          if (ggroup + j < scale_blocks)
+            tp[j] = __ldg(&weight_scale[(size_t)gcol * scale_blocks + ggroup + j]);
       }
-      uint4 *dst = reinterpret_cast<uint4 *>(&sdst[c * (kTileK / 8)]);
-      dst[s] = val;
+      uint32_t *dst = reinterpret_cast<uint32_t *>(sdst + c * (kTileK / 8));
+      // The shared entry index of the first group this thread owns.  The
+      // group index counts 16-element groups, and each group fills two
+      // shared entries (the two weight words of the group).
+#pragma unroll
+      for (int j = 0; j < kSVec; ++j) {
+        const int g = v * kSVec + j;
+        if (g >= groups_per_col) break;
+        const uint32_t hb = raw[j] & 0xFFFFu;
+        dst[g * kSGroups] = hb | (hb << 16);
+        dst[g * kSGroups + 1] = hb | (hb << 16);
+      }
     }
   };
 
@@ -574,8 +612,10 @@ extern "C" void nvfp4_repack_weight_sm70(const uint8_t *weight,
                                           float global_scale, int N, int K,
                                           cudaStream_t stream) {
   if (N <= 0 || K <= 0) return;
-  const int words_per_row = K / 8;
-  const int total = N * words_per_row;
+  // One thread per 16-element scale group; each thread writes two weight
+  // words (the two halves of the group).
+  const int scales_per_row = K / 16;
+  const int total = N * scales_per_row;
   const int threads = 256;
   const int blocks = SM70_NVFP4_CEILDIV(total, threads);
   sm70_nvfp4::nvfp4_repack_weight_sm70_kernel<<<blocks, threads, 0, stream>>>(

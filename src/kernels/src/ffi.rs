@@ -3083,8 +3083,13 @@ extern "C" {
     /// `weight` is `[N, K/2]` bytes with two nibbles per byte (low nibble
     /// first), `weight_scale` is `[N, K/16]` FP8 E4M3 bytes.  The outputs are
     /// `[N, K/8]` uint32 words holding eight contiguous k of one column, and
-    /// `[N, K/8]` uint32 holding the E4M3 scale converted to half in both
-    /// halves.
+    /// `[N, K/16]` uint32 holding the E4M3 scale converted to half in the
+    /// low half.
+    ///
+    /// The scale keeps the NVFP4 group size (16 elements) rather than the
+    /// weight word size (8 elements).  Storing one scale per weight word
+    /// would store every scale twice, and for a 27B model that difference is
+    /// gigabytes of device memory.
     pub fn nvfp4_repack_weight_sm70(
         weight: *const u8,
         weight_scale: *const u8,

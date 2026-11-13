@@ -1437,9 +1437,9 @@ pub fn mlx_dequant_embedding(
 /// that one 32-bit word holds eight contiguous k of one output column.
 ///
 /// The returned tensors are the repacked weights `[N, K/8]` (u32) and the
-/// repacked block scales `[N, K/8]` (u32, the FP8 E4M3 scale converted to
-/// half and duplicated in both halves).  Callers keep them for the lifetime
-/// of the layer so the repack happens once per layer, not once per token.
+/// repacked block scales `[N, K/16]` (u32, the FP8 E4M3 scale converted to
+/// half in the low half).  Callers keep them for the lifetime of the layer
+/// so the repack happens once per layer, not once per token.
 #[cfg(feature = "cuda")]
 pub fn nvfp4_repack_weight_sm70(
     weight: &Tensor,
@@ -1454,7 +1454,10 @@ pub fn nvfp4_repack_weight_sm70(
     let stream = *cuda_dev.cu_stream() as i64;
 
     let weight_out = Tensor::zeros((n, k / 8), DType::U32, dev)?;
-    let scale_out = Tensor::zeros((n, k / 8), DType::U32, dev)?;
+    // One scale per NVFP4 group (16 elements along k), stored as half.
+    // Storing one scale per weight word (8 elements) would duplicate every
+    // scale, which costs gigabytes on a 27B model.
+    let scale_out = Tensor::zeros((n, k / 16), DType::U32, dev)?;
 
     let pointers = {
     let (ws, _) = weight.storage_and_layout();
