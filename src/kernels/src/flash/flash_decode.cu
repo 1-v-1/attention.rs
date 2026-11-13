@@ -107,6 +107,16 @@
 #undef LDG_VEC_LOAD
 #undef FLASH_DECODE_UNPACK_DEFINED
 
+// The reduce kernel that the launchers fall back to when the head dimension
+// is larger than 256.  On Volta the HDIM 512 kernel is not compiled -- it
+// needs more dynamic shared memory than SM70's 64 KB opt-in limit -- so the
+// HDIM 256 kernel takes over.
+#if defined(FLASH_SM70_NO_HDIM512)
+#define flash_decode_paged_reduce_REDUCE_HDIM flash_decode_paged_reduce_256
+#else
+#define flash_decode_paged_reduce_REDUCE_HDIM flash_decode_paged_reduce_512
+#endif
+
 // ============================================================================
 // Launch helpers — unified dtype: 0=f16, 1=bf16
 // ============================================================================
@@ -171,13 +181,24 @@ extern "C" void call_flash_decode_paged_splitk(
     if (dtype == 0) {
         if (head_dim <= 128)      { LAUNCH_DECODE_SK_T(__half, 128); }
         else if (head_dim <= 256) { LAUNCH_DECODE_SK_T(__half, 256); }
+#if defined(FLASH_SM70_NO_HDIM512)
+        // HDIM 512 is not compiled on Volta: it needs more dynamic shared
+        // memory than SM70's 64 KB opt-in limit.  Fall through to the HDIM
+        // 256 kernel instead.
+        else                      { LAUNCH_DECODE_SK_T(__half, 256); }
+#else
         else                      { LAUNCH_DECODE_SK_T(__half, 512); }
+#endif
     }
 #ifndef NO_BF16_KERNEL
     else if (dtype == 1) {
         if (head_dim <= 128)      { LAUNCH_DECODE_SK_T(__nv_bfloat16, 128); }
         else if (head_dim <= 256) { LAUNCH_DECODE_SK_T(__nv_bfloat16, 256); }
+#if defined(FLASH_SM70_NO_HDIM512)
+        else                      { LAUNCH_DECODE_SK_T(__nv_bfloat16, 256); }
+#else
         else                      { LAUNCH_DECODE_SK_T(__nv_bfloat16, 512); }
+#endif
     }
 #endif
     else {
@@ -202,7 +223,7 @@ extern "C" void call_flash_decode_paged_reduce(
             flash_decode_paged_reduce_256<HALF><<<grid, 32, 0, s>>>( \
                 (const float*)workspace, (HALF*)O, num_q_heads, head_dim, num_splits); \
         else \
-            flash_decode_paged_reduce_512<HALF><<<grid, 32, 0, s>>>( \
+            flash_decode_paged_reduce_REDUCE_HDIM<HALF><<<grid, 32, 0, s>>>( \
                 (const float*)workspace, (HALF*)O, num_q_heads, head_dim, num_splits); \
     } while (0)
     if (dtype == 0) { LAUNCH_REDUCE(__half); }
