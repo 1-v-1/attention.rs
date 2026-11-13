@@ -121,15 +121,30 @@
 // Launch helpers — unified dtype: 0=f16, 1=bf16
 // ============================================================================
 
+// The HDIM 512 kernels are not compiled on Volta -- they need more dynamic
+// shared memory than SM70's 64 KB opt-in limit -- so the launchers fall back
+// to the HDIM 256 kernels.  The kernel name is built by pasting the head
+// dimension onto a prefix, so the fallback has to be expressed as a token:
+// `FLASH_HDIM_512` is 256 when the HDIM 512 kernels are absent, and the
+// two-stage paste expands it before the concatenation happens.
+#if defined(FLASH_SM70_NO_HDIM512)
+#define FLASH_HDIM_512 256
+#else
+#define FLASH_HDIM_512 512
+#endif
+
+#define FLASH_CONCAT_(a, b) a##b
+#define FLASH_CONCAT(a, b) FLASH_CONCAT_(a, b)
+
 #define LAUNCH_DECODE_T(HALF, HD) \
-    flash_decode_paged_##HD<HALF><<<grid, 256, 0, s>>>( \
+    FLASH_CONCAT(flash_decode_paged_, HD)<HALF><<<grid, 256, 0, s>>>( \
         (const HALF*)Q, (const HALF*)K_cache, (const HALF*)V_cache, (HALF*)O, \
         block_tables, seq_lens, max_blocks_per_seq, \
         num_q_heads, num_kv_heads, head_dim, block_size, \
         inv_sqrt_d, q_stride, sliding_window, softcap)
 
 #define LAUNCH_DECODE_SK_T(HALF, HD) \
-    flash_decode_paged_splitk_##HD<HALF><<<grid, 256, 0, s>>>( \
+    FLASH_CONCAT(flash_decode_paged_splitk_, HD)<HALF><<<grid, 256, 0, s>>>( \
         (const HALF*)Q, (const HALF*)K_cache, (const HALF*)V_cache, (float*)workspace, \
         block_tables, seq_lens, max_blocks_per_seq, \
         num_q_heads, num_kv_heads, head_dim, block_size, \
@@ -181,24 +196,13 @@ extern "C" void call_flash_decode_paged_splitk(
     if (dtype == 0) {
         if (head_dim <= 128)      { LAUNCH_DECODE_SK_T(__half, 128); }
         else if (head_dim <= 256) { LAUNCH_DECODE_SK_T(__half, 256); }
-#if defined(FLASH_SM70_NO_HDIM512)
-        // HDIM 512 is not compiled on Volta: it needs more dynamic shared
-        // memory than SM70's 64 KB opt-in limit.  Fall through to the HDIM
-        // 256 kernel instead.
-        else                      { LAUNCH_DECODE_SK_T(__half, 256); }
-#else
-        else                      { LAUNCH_DECODE_SK_T(__half, 512); }
-#endif
+        else                      { LAUNCH_DECODE_SK_T(__half, FLASH_HDIM_512); }
     }
 #ifndef NO_BF16_KERNEL
     else if (dtype == 1) {
         if (head_dim <= 128)      { LAUNCH_DECODE_SK_T(__nv_bfloat16, 128); }
         else if (head_dim <= 256) { LAUNCH_DECODE_SK_T(__nv_bfloat16, 256); }
-#if defined(FLASH_SM70_NO_HDIM512)
-        else                      { LAUNCH_DECODE_SK_T(__nv_bfloat16, 256); }
-#else
-        else                      { LAUNCH_DECODE_SK_T(__nv_bfloat16, 512); }
-#endif
+        else                      { LAUNCH_DECODE_SK_T(__nv_bfloat16, FLASH_HDIM_512); }
     }
 #endif
     else {

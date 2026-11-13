@@ -405,13 +405,32 @@
 // Dispatch launchers — called from Rust FFI
 // ============================================================================
 
-#define DISPATCH_PREFILL(HDIM_VAL, ...) flash_prefill_paged_##HDIM_VAL<<<__VA_ARGS__>>>
-#define DISPATCH_PREFILL_FP8(HDIM_VAL, ...) flash_prefill_paged_fp8_##HDIM_VAL<<<__VA_ARGS__>>>
-#define DISPATCH_DECODE(HDIM_VAL, ...) flash_decode_paged_##HDIM_VAL<<<__VA_ARGS__>>>
-#define DISPATCH_DECODE_SPLITK(HDIM_VAL, ...) flash_decode_paged_splitk_##HDIM_VAL<<<__VA_ARGS__>>>
-#define DISPATCH_DECODE_REDUCE(HDIM_VAL, ...) flash_decode_paged_reduce_##HDIM_VAL<<<__VA_ARGS__>>>
-#define DISPATCH_DECODE_FP8(HDIM_VAL, ...) flash_decode_paged_fp8_##HDIM_VAL<<<__VA_ARGS__>>>
-#define DISPATCH_DECODE_SPLITK_FP8(HDIM_VAL, ...) flash_decode_paged_splitk_fp8_##HDIM_VAL<<<__VA_ARGS__>>>
+// The HDIM 512 kernels are not compiled on Volta -- they need more dynamic
+// shared memory than SM70's 64 KB opt-in limit -- so the launchers have to
+// fall back to the HDIM 256 kernels.
+//
+// The kernel name is built by pasting the head dimension onto a prefix, so
+// the fallback cannot be expressed by changing the call site alone: the
+// pasted token has to be 256 instead of 512.  `FLASH_HDIM_512` is that
+// token, and the two-stage `CONCAT`/`FLASH_CONCAT` below expands it before
+// the paste happens, so `FLASH_CONCAT(prefill_paged_, FLASH_HDIM_512)`
+// yields `prefill_paged_256` when the HDIM 512 kernels are absent.
+#if defined(FLASH_SM70_NO_HDIM512)
+#define FLASH_HDIM_512 256
+#else
+#define FLASH_HDIM_512 512
+#endif
+
+#define FLASH_CONCAT_(a, b) a##b
+#define FLASH_CONCAT(a, b) FLASH_CONCAT_(a, b)
+
+#define DISPATCH_PREFILL(HDIM_VAL, ...) FLASH_CONCAT(flash_prefill_paged_, HDIM_VAL)<<<__VA_ARGS__>>>
+#define DISPATCH_PREFILL_FP8(HDIM_VAL, ...) FLASH_CONCAT(flash_prefill_paged_fp8_, HDIM_VAL)<<<__VA_ARGS__>>>
+#define DISPATCH_DECODE(HDIM_VAL, ...) FLASH_CONCAT(flash_decode_paged_, HDIM_VAL)<<<__VA_ARGS__>>>
+#define DISPATCH_DECODE_SPLITK(HDIM_VAL, ...) FLASH_CONCAT(flash_decode_paged_splitk_, HDIM_VAL)<<<__VA_ARGS__>>>
+#define DISPATCH_DECODE_REDUCE(HDIM_VAL, ...) FLASH_CONCAT(flash_decode_paged_reduce_, HDIM_VAL)<<<__VA_ARGS__>>>
+#define DISPATCH_DECODE_FP8(HDIM_VAL, ...) FLASH_CONCAT(flash_decode_paged_fp8_, HDIM_VAL)<<<__VA_ARGS__>>>
+#define DISPATCH_DECODE_SPLITK_FP8(HDIM_VAL, ...) FLASH_CONCAT(flash_decode_paged_splitk_fp8_, HDIM_VAL)<<<__VA_ARGS__>>>
 
 // Launchers: dtype 0=f16, 1=bf16 (BF16 only when !NO_BF16_KERNEL)
 
@@ -432,7 +451,7 @@ extern "C" void call_flash_prefill_paged(
         unsigned int br = 32;
         dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
 #define LAUNCH_PREFILL(HD, THREADS, SMEM) \
-            flash_prefill_paged_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+            FLASH_CONCAT(flash_prefill_paged_, HD)<HALF><<<grid, THREADS, SMEM, s>>>( \
                 (const HALF*)Q, (const HALF*)K_cache, (const HALF*)V_cache, (HALF*)O, \
                 block_tables, block_table_stride, cu_seqlens_q, context_lens, \
                 num_q_heads, num_kv_heads, head_dim, cache_block_size, \
@@ -454,19 +473,20 @@ extern "C" void call_flash_prefill_paged(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(256, 128, smem);
         } else {
+#if defined(FLASH_SM70_NO_HDIM512)
             // HDIM 512 is not compiled on Volta: it needs 101120 B of
             // dynamic shared memory, more than SM70's 64 KB opt-in limit.
             // Fall through to the HDIM 256 kernel instead.
-        #if !defined(FLASH_SM70_NO_HDIM512)
+            unsigned int smem = (32*264 + paged_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            LAUNCH_PREFILL(FLASH_HDIM_512, 128, smem);
+#else
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(512, 256, smem);
-        #else
-            smem = 0;
-            LAUNCH_PREFILL(256, 128, smem);
-        #endif
+#endif
         }
 #undef LAUNCH_PREFILL
 #undef HALF
@@ -477,7 +497,7 @@ extern "C" void call_flash_prefill_paged(
         unsigned int br = 32;
         dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
 #define LAUNCH_PREFILL(HD, THREADS, SMEM) \
-            flash_prefill_paged_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+            FLASH_CONCAT(flash_prefill_paged_, HD)<HALF><<<grid, THREADS, SMEM, s>>>( \
                 (const HALF*)Q, (const HALF*)K_cache, (const HALF*)V_cache, (HALF*)O, \
                 block_tables, block_table_stride, cu_seqlens_q, context_lens, \
                 num_q_heads, num_kv_heads, head_dim, cache_block_size, \
@@ -499,19 +519,20 @@ extern "C" void call_flash_prefill_paged(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(256, 128, smem);
         } else {
+#if defined(FLASH_SM70_NO_HDIM512)
             // HDIM 512 is not compiled on Volta: it needs 101120 B of
             // dynamic shared memory, more than SM70's 64 KB opt-in limit.
             // Fall through to the HDIM 256 kernel instead.
-        #if !defined(FLASH_SM70_NO_HDIM512)
+            unsigned int smem = (32*264 + paged_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            LAUNCH_PREFILL(FLASH_HDIM_512, 128, smem);
+#else
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(512, 256, smem);
-        #else
-            smem = 0;
-            LAUNCH_PREFILL(256, 128, smem);
-        #endif
+#endif
         }
 #undef LAUNCH_PREFILL
 #undef HALF
@@ -540,7 +561,7 @@ extern "C" void call_flash_prefill_paged_fp8(
         unsigned int br = 32;
         dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
 #define LAUNCH_PREFILL_FP8(HD, THREADS, SMEM) \
-            flash_prefill_paged_fp8_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+            FLASH_CONCAT(flash_prefill_paged_fp8_, HD)<HALF><<<grid, THREADS, SMEM, s>>>( \
                 (const HALF*)Q, K_cache, V_cache, (HALF*)O, \
                 block_tables, block_table_stride, cu_seqlens_q, context_lens, \
                 num_q_heads, num_kv_heads, head_dim, cache_block_size, \
@@ -566,16 +587,18 @@ extern "C" void call_flash_prefill_paged_fp8(
             // HDIM 512 is not compiled on Volta: it needs 101120 B of
             // dynamic shared memory, more than SM70's 64 KB opt-in limit.
             // Fall through to the HDIM 256 kernel instead.
-        #if !defined(FLASH_SM70_NO_HDIM512)
+#if defined(FLASH_SM70_NO_HDIM512)
+            // HDIM 512 is not compiled on Volta: it needs 101120 B of
+            // dynamic shared memory, more than SM70's 64 KB opt-in limit.
+            // Fall through to the HDIM 256 kernel instead.
+            LAUNCH_PREFILL_FP8(FLASH_HDIM_512, 128, smem);
+#else
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_fp8_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL_FP8(512, 256, smem);
-        #else
-            smem = 0;
-            LAUNCH_PREFILL_FP8(256, 128, smem);
-        #endif
+#endif
         }
 #undef LAUNCH_PREFILL_FP8
 #undef HALF
@@ -586,7 +609,7 @@ extern "C" void call_flash_prefill_paged_fp8(
         unsigned int br = 32;
         dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
 #define LAUNCH_PREFILL_FP8(HD, THREADS, SMEM) \
-            flash_prefill_paged_fp8_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+            FLASH_CONCAT(flash_prefill_paged_fp8_, HD)<HALF><<<grid, THREADS, SMEM, s>>>( \
                 (const HALF*)Q, K_cache, V_cache, (HALF*)O, \
                 block_tables, block_table_stride, cu_seqlens_q, context_lens, \
                 num_q_heads, num_kv_heads, head_dim, cache_block_size, \
@@ -612,16 +635,18 @@ extern "C" void call_flash_prefill_paged_fp8(
             // HDIM 512 is not compiled on Volta: it needs 101120 B of
             // dynamic shared memory, more than SM70's 64 KB opt-in limit.
             // Fall through to the HDIM 256 kernel instead.
-        #if !defined(FLASH_SM70_NO_HDIM512)
+#if defined(FLASH_SM70_NO_HDIM512)
+            // HDIM 512 is not compiled on Volta: it needs 101120 B of
+            // dynamic shared memory, more than SM70's 64 KB opt-in limit.
+            // Fall through to the HDIM 256 kernel instead.
+            LAUNCH_PREFILL_FP8(FLASH_HDIM_512, 128, smem);
+#else
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_fp8_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL_FP8(512, 256, smem);
-        #else
-            smem = 0;
-            LAUNCH_PREFILL_FP8(256, 128, smem);
-        #endif
+#endif
         }
 #undef LAUNCH_PREFILL_FP8
 #undef HALF
@@ -650,7 +675,7 @@ extern "C" void call_flash_decode_paged_fp8(
         (void)gqa_ratio;
         dim3 grid(num_q_heads, num_seqs);
 #define LAUNCH_DECODE_FP8(HD) \
-            flash_decode_paged_fp8_##HD<HALF><<<grid, 256, 0, s>>>( \
+            FLASH_CONCAT(flash_decode_paged_fp8_, HD)<HALF><<<grid, 256, 0, s>>>( \
                 (const HALF*)Q, K_cache, V_cache, (HALF*)O, \
                 block_tables, seq_lens, max_blocks_per_seq, \
                 num_q_heads, num_kv_heads, head_dim, block_size, \
@@ -658,7 +683,7 @@ extern "C" void call_flash_decode_paged_fp8(
                 k_scale_ptr, v_scale_ptr, fp8_cache_stride)
         if (head_dim <= 128) { LAUNCH_DECODE_FP8(128); }
         else if (head_dim <= 256) { LAUNCH_DECODE_FP8(256); }
-        else { LAUNCH_DECODE_FP8(512); }
+        else { LAUNCH_DECODE_FP8(FLASH_HDIM_512); }
 #undef LAUNCH_DECODE_FP8
 #undef HALF
     }
@@ -668,7 +693,7 @@ extern "C" void call_flash_decode_paged_fp8(
         (void)gqa_ratio;
         dim3 grid(num_q_heads, num_seqs);
 #define LAUNCH_DECODE_FP8(HD) \
-            flash_decode_paged_fp8_##HD<HALF><<<grid, 256, 0, s>>>( \
+            FLASH_CONCAT(flash_decode_paged_fp8_, HD)<HALF><<<grid, 256, 0, s>>>( \
                 (const HALF*)Q, K_cache, V_cache, (HALF*)O, \
                 block_tables, seq_lens, max_blocks_per_seq, \
                 num_q_heads, num_kv_heads, head_dim, block_size, \
@@ -676,7 +701,7 @@ extern "C" void call_flash_decode_paged_fp8(
                 k_scale_ptr, v_scale_ptr, fp8_cache_stride)
         if (head_dim <= 128) { LAUNCH_DECODE_FP8(128); }
         else if (head_dim <= 256) { LAUNCH_DECODE_FP8(256); }
-        else { LAUNCH_DECODE_FP8(512); }
+        else { LAUNCH_DECODE_FP8(FLASH_HDIM_512); }
 #undef LAUNCH_DECODE_FP8
 #undef HALF
     }
@@ -705,7 +730,7 @@ extern "C" void call_flash_decode_paged_splitk_fp8(
         (void)gqa_ratio;
         dim3 grid(num_q_heads, num_splits, num_seqs);
 #define LAUNCH_DECODE_SK_FP8(HD) \
-            flash_decode_paged_splitk_fp8_##HD<HALF><<<grid, 256, 0, s>>>( \
+            FLASH_CONCAT(flash_decode_paged_splitk_fp8_, HD)<HALF><<<grid, 256, 0, s>>>( \
                 (const HALF*)Q, K_cache, V_cache, (float*)workspace, \
                 block_tables, seq_lens, max_blocks_per_seq, \
                 num_q_heads, num_kv_heads, head_dim, block_size, \
@@ -713,7 +738,7 @@ extern "C" void call_flash_decode_paged_splitk_fp8(
                 k_scale_ptr, v_scale_ptr, fp8_cache_stride, sliding_window)
         if (head_dim <= 128) { LAUNCH_DECODE_SK_FP8(128); }
         else if (head_dim <= 256) { LAUNCH_DECODE_SK_FP8(256); }
-        else { LAUNCH_DECODE_SK_FP8(512); }
+        else { LAUNCH_DECODE_SK_FP8(FLASH_HDIM_512); }
 #undef LAUNCH_DECODE_SK_FP8
 #undef HALF
     }
@@ -723,7 +748,7 @@ extern "C" void call_flash_decode_paged_splitk_fp8(
         (void)gqa_ratio;
         dim3 grid(num_q_heads, num_splits, num_seqs);
 #define LAUNCH_DECODE_SK_FP8(HD) \
-            flash_decode_paged_splitk_fp8_##HD<HALF><<<grid, 256, 0, s>>>( \
+            FLASH_CONCAT(flash_decode_paged_splitk_fp8_, HD)<HALF><<<grid, 256, 0, s>>>( \
                 (const HALF*)Q, K_cache, V_cache, (float*)workspace, \
                 block_tables, seq_lens, max_blocks_per_seq, \
                 num_q_heads, num_kv_heads, head_dim, block_size, \
@@ -731,7 +756,7 @@ extern "C" void call_flash_decode_paged_splitk_fp8(
                 k_scale_ptr, v_scale_ptr, fp8_cache_stride, sliding_window)
         if (head_dim <= 128) { LAUNCH_DECODE_SK_FP8(128); }
         else if (head_dim <= 256) { LAUNCH_DECODE_SK_FP8(256); }
-        else { LAUNCH_DECODE_SK_FP8(512); }
+        else { LAUNCH_DECODE_SK_FP8(FLASH_HDIM_512); }
 #undef LAUNCH_DECODE_SK_FP8
 #undef HALF
     }
@@ -756,13 +781,13 @@ extern "C" void call_flash_reshape_and_cache(
         if (threads < 32) threads = 32;
         if (threads > 256) threads = 256;
 #define LAUNCH_CACHE(HD) \
-            flash_reshape_and_cache_##HD<HALF><<<grid, threads, 0, s>>>( \
+            FLASH_CONCAT(flash_reshape_and_cache_, HD)<HALF><<<grid, threads, 0, s>>>( \
                 (const HALF*)key, (const HALF*)value, \
                 (HALF*)key_cache, (HALF*)value_cache, \
                 slot_mapping, num_tokens, num_kv_heads, head_dim, cache_block_size)
         if (head_dim <= 128) { LAUNCH_CACHE(128); }
         else if (head_dim <= 256) { LAUNCH_CACHE(256); }
-        else { LAUNCH_CACHE(512); }
+        else { LAUNCH_CACHE(FLASH_HDIM_512); }
 #undef LAUNCH_CACHE
 #undef HALF
     }
@@ -774,13 +799,13 @@ extern "C" void call_flash_reshape_and_cache(
         if (threads < 32) threads = 32;
         if (threads > 256) threads = 256;
 #define LAUNCH_CACHE(HD) \
-            flash_reshape_and_cache_##HD<HALF><<<grid, threads, 0, s>>>( \
+            FLASH_CONCAT(flash_reshape_and_cache_, HD)<HALF><<<grid, threads, 0, s>>>( \
                 (const HALF*)key, (const HALF*)value, \
                 (HALF*)key_cache, (HALF*)value_cache, \
                 slot_mapping, num_tokens, num_kv_heads, head_dim, cache_block_size)
         if (head_dim <= 128) { LAUNCH_CACHE(128); }
         else if (head_dim <= 256) { LAUNCH_CACHE(256); }
-        else { LAUNCH_CACHE(512); }
+        else { LAUNCH_CACHE(FLASH_HDIM_512); }
 #undef LAUNCH_CACHE
 #undef HALF
     }
@@ -806,14 +831,14 @@ extern "C" void call_flash_reshape_and_cache_fp8_kv(
         if (threads > 256) threads = 256;
         if (threads < 32) threads = 32;
 #define LAUNCH_CACHE_FP8(HD) \
-            flash_reshape_and_cache_fp8_##HD<HALF><<<grid, threads, 0, s>>>( \
+            FLASH_CONCAT(flash_reshape_and_cache_fp8_, HD)<HALF><<<grid, threads, 0, s>>>( \
                 (const HALF*)key, (const HALF*)value, \
                 key_cache, value_cache, slot_mapping, \
                 num_tokens, num_kv_heads, head_dim, cache_block_size, \
                 k_scale_ptr, v_scale_ptr)
         if (head_dim <= 128) { LAUNCH_CACHE_FP8(128); }
         else if (head_dim <= 256) { LAUNCH_CACHE_FP8(256); }
-        else { LAUNCH_CACHE_FP8(512); }
+        else { LAUNCH_CACHE_FP8(FLASH_HDIM_512); }
 #undef LAUNCH_CACHE_FP8
 #undef HALF
     }
@@ -825,14 +850,14 @@ extern "C" void call_flash_reshape_and_cache_fp8_kv(
         if (threads > 256) threads = 256;
         if (threads < 32) threads = 32;
 #define LAUNCH_CACHE_FP8(HD) \
-            flash_reshape_and_cache_fp8_##HD<HALF><<<grid, threads, 0, s>>>( \
+            FLASH_CONCAT(flash_reshape_and_cache_fp8_, HD)<HALF><<<grid, threads, 0, s>>>( \
                 (const HALF*)key, (const HALF*)value, \
                 key_cache, value_cache, slot_mapping, \
                 num_tokens, num_kv_heads, head_dim, cache_block_size, \
                 k_scale_ptr, v_scale_ptr)
         if (head_dim <= 128) { LAUNCH_CACHE_FP8(128); }
         else if (head_dim <= 256) { LAUNCH_CACHE_FP8(256); }
-        else { LAUNCH_CACHE_FP8(512); }
+        else { LAUNCH_CACHE_FP8(FLASH_HDIM_512); }
 #undef LAUNCH_CACHE_FP8
 #undef HALF
     }
@@ -857,13 +882,13 @@ extern "C" void call_flash_tq_store_k8v4(
         dim3 grid(num_tokens, num_kv_heads);
         unsigned int threads = 32;
 #define LAUNCH_TQ_STORE(HD) \
-            flash_tq_store_k8v4_##HD<HALF><<<grid, threads, 0, s>>>( \
+            FLASH_CONCAT(flash_tq_store_k8v4_, HD)<HALF><<<grid, threads, 0, s>>>( \
                 (const HALF*)K, (const HALF*)V, \
                 K_cache, (float*)V_absmax, (unsigned char*)V_quant, \
                 slot_mapping, num_tokens, num_kv_heads, head_dim, block_size, k_scale_ptr)
         if (head_dim <= 128) { LAUNCH_TQ_STORE(128); }
         else if (head_dim <= 256) { LAUNCH_TQ_STORE(256); }
-        else { LAUNCH_TQ_STORE(512); }
+        else { LAUNCH_TQ_STORE(FLASH_HDIM_512); }
 #undef LAUNCH_TQ_STORE
 #undef HALF
     }
@@ -873,13 +898,13 @@ extern "C" void call_flash_tq_store_k8v4(
         dim3 grid(num_tokens, num_kv_heads);
         unsigned int threads = 32;
 #define LAUNCH_TQ_STORE(HD) \
-            flash_tq_store_k8v4_##HD<HALF><<<grid, threads, 0, s>>>( \
+            FLASH_CONCAT(flash_tq_store_k8v4_, HD)<HALF><<<grid, threads, 0, s>>>( \
                 (const HALF*)K, (const HALF*)V, \
                 K_cache, (float*)V_absmax, (unsigned char*)V_quant, \
                 slot_mapping, num_tokens, num_kv_heads, head_dim, block_size, k_scale_ptr)
         if (head_dim <= 128) { LAUNCH_TQ_STORE(128); }
         else if (head_dim <= 256) { LAUNCH_TQ_STORE(256); }
-        else { LAUNCH_TQ_STORE(512); }
+        else { LAUNCH_TQ_STORE(FLASH_HDIM_512); }
 #undef LAUNCH_TQ_STORE
 #undef HALF
     }
@@ -906,7 +931,7 @@ extern "C" void call_flash_tq_decode_k8v4(
         dim3 grid(num_q_heads, num_seqs);
         unsigned int threads = 8 * 32;
 #define LAUNCH_TQ_DECODE(HD) \
-            flash_tq_decode_k8v4_##HD<HALF><<<grid, threads, 0, s>>>( \
+            FLASH_CONCAT(flash_tq_decode_k8v4_, HD)<HALF><<<grid, threads, 0, s>>>( \
                 (const HALF*)Q, K_cache, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
                 block_tables, seq_lens, max_blocks_per_seq, \
@@ -914,7 +939,7 @@ extern "C" void call_flash_tq_decode_k8v4(
                 inv_sqrt_d, num_seqs, q_stride, softcap, k_scale_ptr, sliding_window)
         if (head_dim <= 128) { LAUNCH_TQ_DECODE(128); }
         else if (head_dim <= 256) { LAUNCH_TQ_DECODE(256); }
-        else { LAUNCH_TQ_DECODE(512); }
+        else { LAUNCH_TQ_DECODE(FLASH_HDIM_512); }
 #undef LAUNCH_TQ_DECODE
 #undef HALF
     }
@@ -924,7 +949,7 @@ extern "C" void call_flash_tq_decode_k8v4(
         dim3 grid(num_q_heads, num_seqs);
         unsigned int threads = 8 * 32;
 #define LAUNCH_TQ_DECODE(HD) \
-            flash_tq_decode_k8v4_##HD<HALF><<<grid, threads, 0, s>>>( \
+            FLASH_CONCAT(flash_tq_decode_k8v4_, HD)<HALF><<<grid, threads, 0, s>>>( \
                 (const HALF*)Q, K_cache, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
                 block_tables, seq_lens, max_blocks_per_seq, \
@@ -932,7 +957,7 @@ extern "C" void call_flash_tq_decode_k8v4(
                 inv_sqrt_d, num_seqs, q_stride, softcap, k_scale_ptr, sliding_window)
         if (head_dim <= 128) { LAUNCH_TQ_DECODE(128); }
         else if (head_dim <= 256) { LAUNCH_TQ_DECODE(256); }
-        else { LAUNCH_TQ_DECODE(512); }
+        else { LAUNCH_TQ_DECODE(FLASH_HDIM_512); }
 #undef LAUNCH_TQ_DECODE
 #undef HALF
     }
@@ -960,7 +985,7 @@ extern "C" void call_flash_tq_decode_k8v4_splitk(
         unsigned int threads = 8 * 32;
         dim3 grid(num_q_heads, num_splits, num_seqs);
 #define LAUNCH_TQ_DECODE_SK(HD) \
-            flash_tq_decode_k8v4_splitk_##HD<HALF><<<grid, threads, 0, s>>>( \
+            FLASH_CONCAT(flash_tq_decode_k8v4_splitk_, HD)<HALF><<<grid, threads, 0, s>>>( \
                 (const HALF*)Q, K_cache, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (float*)workspace, \
                 block_tables, seq_lens, max_blocks_per_seq, \
@@ -968,7 +993,7 @@ extern "C" void call_flash_tq_decode_k8v4_splitk(
                 inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, k_scale_ptr, sliding_window)
         if (head_dim <= 128) { LAUNCH_TQ_DECODE_SK(128); }
         else if (head_dim <= 256) { LAUNCH_TQ_DECODE_SK(256); }
-        else { LAUNCH_TQ_DECODE_SK(512); }
+        else { LAUNCH_TQ_DECODE_SK(FLASH_HDIM_512); }
 #undef LAUNCH_TQ_DECODE_SK
 #undef HALF
     }
@@ -978,7 +1003,7 @@ extern "C" void call_flash_tq_decode_k8v4_splitk(
         unsigned int threads = 8 * 32;
         dim3 grid(num_q_heads, num_splits, num_seqs);
 #define LAUNCH_TQ_DECODE_SK(HD) \
-            flash_tq_decode_k8v4_splitk_##HD<HALF><<<grid, threads, 0, s>>>( \
+            FLASH_CONCAT(flash_tq_decode_k8v4_splitk_, HD)<HALF><<<grid, threads, 0, s>>>( \
                 (const HALF*)Q, K_cache, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (float*)workspace, \
                 block_tables, seq_lens, max_blocks_per_seq, \
@@ -986,7 +1011,7 @@ extern "C" void call_flash_tq_decode_k8v4_splitk(
                 inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, k_scale_ptr, sliding_window)
         if (head_dim <= 128) { LAUNCH_TQ_DECODE_SK(128); }
         else if (head_dim <= 256) { LAUNCH_TQ_DECODE_SK(256); }
-        else { LAUNCH_TQ_DECODE_SK(512); }
+        else { LAUNCH_TQ_DECODE_SK(FLASH_HDIM_512); }
 #undef LAUNCH_TQ_DECODE_SK
 #undef HALF
     }
@@ -1009,14 +1034,14 @@ extern "C" void call_flash_tq4_store(
 #define HALF __half
         dim3 grid(num_tokens, num_kv_heads);
 #define LAUNCH_STORE(HD) \
-            flash_tq4_store_##HD<HALF><<<grid, 32, 0, s>>>( \
+            FLASH_CONCAT(flash_tq4_store_, HD)<HALF><<<grid, 32, 0, s>>>( \
                 (const HALF*)K, (const HALF*)V, \
                 (float*)K_absmax, (unsigned char*)K_quant, \
                 (float*)V_absmax, (unsigned char*)V_quant, \
                 slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
         if (head_dim <= 128) { LAUNCH_STORE(128); }
         else if (head_dim <= 256) { LAUNCH_STORE(256); }
-        else { LAUNCH_STORE(512); }
+        else { LAUNCH_STORE(FLASH_HDIM_512); }
 #undef LAUNCH_STORE
 #undef HALF
     }
@@ -1025,14 +1050,14 @@ extern "C" void call_flash_tq4_store(
 #define HALF __nv_bfloat16
         dim3 grid(num_tokens, num_kv_heads);
 #define LAUNCH_STORE(HD) \
-            flash_tq4_store_##HD<HALF><<<grid, 32, 0, s>>>( \
+            FLASH_CONCAT(flash_tq4_store_, HD)<HALF><<<grid, 32, 0, s>>>( \
                 (const HALF*)K, (const HALF*)V, \
                 (float*)K_absmax, (unsigned char*)K_quant, \
                 (float*)V_absmax, (unsigned char*)V_quant, \
                 slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
         if (head_dim <= 128) { LAUNCH_STORE(128); }
         else if (head_dim <= 256) { LAUNCH_STORE(256); }
-        else { LAUNCH_STORE(512); }
+        else { LAUNCH_STORE(FLASH_HDIM_512); }
 #undef LAUNCH_STORE
 #undef HALF
     }
@@ -1059,7 +1084,7 @@ extern "C" void call_flash_tq4_decode(
 #define HALF __half
         dim3 grid(num_q_heads, num_seqs);
 #define LAUNCH_DECODE(HD) \
-            flash_tq4_decode_##HD<HALF><<<grid, 256, 0, s>>>( \
+            FLASH_CONCAT(flash_tq4_decode_, HD)<HALF><<<grid, 256, 0, s>>>( \
                 (const HALF*)Q, \
                 (const float*)K_absmax, (const unsigned char*)K_quant, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
@@ -1068,7 +1093,7 @@ extern "C" void call_flash_tq4_decode(
                 inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window)
         if (head_dim <= 128) { LAUNCH_DECODE(128); }
         else if (head_dim <= 256) { LAUNCH_DECODE(256); }
-        else { LAUNCH_DECODE(512); }
+        else { LAUNCH_DECODE(FLASH_HDIM_512); }
 #undef LAUNCH_DECODE
 #undef HALF
     }
@@ -1077,7 +1102,7 @@ extern "C" void call_flash_tq4_decode(
 #define HALF __nv_bfloat16
         dim3 grid(num_q_heads, num_seqs);
 #define LAUNCH_DECODE(HD) \
-            flash_tq4_decode_##HD<HALF><<<grid, 256, 0, s>>>( \
+            FLASH_CONCAT(flash_tq4_decode_, HD)<HALF><<<grid, 256, 0, s>>>( \
                 (const HALF*)Q, \
                 (const float*)K_absmax, (const unsigned char*)K_quant, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
@@ -1086,7 +1111,7 @@ extern "C" void call_flash_tq4_decode(
                 inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window)
         if (head_dim <= 128) { LAUNCH_DECODE(128); }
         else if (head_dim <= 256) { LAUNCH_DECODE(256); }
-        else { LAUNCH_DECODE(512); }
+        else { LAUNCH_DECODE(FLASH_HDIM_512); }
 #undef LAUNCH_DECODE
 #undef HALF
     }
@@ -1113,7 +1138,7 @@ extern "C" void call_flash_tq4_decode_splitk(
 #define HALF __half
         dim3 grid(num_q_heads, num_splits, num_seqs);
 #define LAUNCH_DECODE_SK(HD) \
-            flash_tq4_decode_splitk_##HD<HALF><<<grid, 256, 0, s>>>( \
+            FLASH_CONCAT(flash_tq4_decode_splitk_, HD)<HALF><<<grid, 256, 0, s>>>( \
                 (const HALF*)Q, \
                 (const float*)K_absmax, (const unsigned char*)K_quant, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (float*)workspace, \
@@ -1122,7 +1147,7 @@ extern "C" void call_flash_tq4_decode_splitk(
                 inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, sliding_window)
         if (head_dim <= 128) { LAUNCH_DECODE_SK(128); }
         else if (head_dim <= 256) { LAUNCH_DECODE_SK(256); }
-        else { LAUNCH_DECODE_SK(512); }
+        else { LAUNCH_DECODE_SK(FLASH_HDIM_512); }
 #undef LAUNCH_DECODE_SK
 #undef HALF
     }
@@ -1131,7 +1156,7 @@ extern "C" void call_flash_tq4_decode_splitk(
 #define HALF __nv_bfloat16
         dim3 grid(num_q_heads, num_splits, num_seqs);
 #define LAUNCH_DECODE_SK(HD) \
-            flash_tq4_decode_splitk_##HD<HALF><<<grid, 256, 0, s>>>( \
+            FLASH_CONCAT(flash_tq4_decode_splitk_, HD)<HALF><<<grid, 256, 0, s>>>( \
                 (const HALF*)Q, \
                 (const float*)K_absmax, (const unsigned char*)K_quant, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (float*)workspace, \
@@ -1140,7 +1165,7 @@ extern "C" void call_flash_tq4_decode_splitk(
                 inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, sliding_window)
         if (head_dim <= 128) { LAUNCH_DECODE_SK(128); }
         else if (head_dim <= 256) { LAUNCH_DECODE_SK(256); }
-        else { LAUNCH_DECODE_SK(512); }
+        else { LAUNCH_DECODE_SK(FLASH_HDIM_512); }
 #undef LAUNCH_DECODE_SK
 #undef HALF
     }
@@ -1169,7 +1194,7 @@ extern "C" void call_flash_tq4_prefill(
         unsigned int br = 32;
         dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
 #define LAUNCH_PREFILL(HD, THREADS, SMEM) \
-            flash_tq4_prefill_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+            FLASH_CONCAT(flash_tq4_prefill_, HD)<HALF><<<grid, THREADS, SMEM, s>>>( \
                 (const HALF*)Q, \
                 (const float*)K_absmax, (const unsigned char*)K_quant, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
@@ -1203,19 +1228,20 @@ extern "C" void call_flash_tq4_prefill(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(256, 128, smem);
         } else {
+#if defined(FLASH_SM70_NO_HDIM512)
             // HDIM 512 is not compiled on Volta: it needs 101120 B of
             // dynamic shared memory, more than SM70's 64 KB opt-in limit.
             // Fall through to the HDIM 256 kernel instead.
-        #if !defined(FLASH_SM70_NO_HDIM512)
+            unsigned int smem = (32*264 + k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            LAUNCH_PREFILL(FLASH_HDIM_512, 128, smem);
+#else
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq4_prefill_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(512, 256, smem);
-        #else
-            smem = 0;
-            LAUNCH_PREFILL(256, 128, smem);
-        #endif
+#endif
         }
 #undef LAUNCH_PREFILL
 #undef HALF
@@ -1226,7 +1252,7 @@ extern "C" void call_flash_tq4_prefill(
         unsigned int br = 32;
         dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
 #define LAUNCH_PREFILL(HD, THREADS, SMEM) \
-            flash_tq4_prefill_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+            FLASH_CONCAT(flash_tq4_prefill_, HD)<HALF><<<grid, THREADS, SMEM, s>>>( \
                 (const HALF*)Q, \
                 (const float*)K_absmax, (const unsigned char*)K_quant, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
@@ -1248,19 +1274,20 @@ extern "C" void call_flash_tq4_prefill(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(256, 128, smem);
         } else {
+#if defined(FLASH_SM70_NO_HDIM512)
             // HDIM 512 is not compiled on Volta: it needs 101120 B of
             // dynamic shared memory, more than SM70's 64 KB opt-in limit.
             // Fall through to the HDIM 256 kernel instead.
-        #if !defined(FLASH_SM70_NO_HDIM512)
+            unsigned int smem = (32*264 + k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            LAUNCH_PREFILL(FLASH_HDIM_512, 128, smem);
+#else
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq4_prefill_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(512, 256, smem);
-        #else
-            smem = 0;
-            LAUNCH_PREFILL(256, 128, smem);
-        #endif
+#endif
         }
 #undef LAUNCH_PREFILL
 #undef HALF
@@ -1284,14 +1311,14 @@ extern "C" void call_flash_tq3_store(
 #define HALF __half
         dim3 grid(num_tokens, num_kv_heads);
 #define LAUNCH_STORE(HD) \
-            flash_tq3_store_##HD<HALF><<<grid, 32, 0, s>>>( \
+            FLASH_CONCAT(flash_tq3_store_, HD)<HALF><<<grid, 32, 0, s>>>( \
                 (const HALF*)K, (const HALF*)V, \
                 (float*)K_absmax, (unsigned char*)K_quant, \
                 (float*)V_absmax, (unsigned char*)V_quant, \
                 slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
         if (head_dim <= 128) { LAUNCH_STORE(128); }
         else if (head_dim <= 256) { LAUNCH_STORE(256); }
-        else { LAUNCH_STORE(512); }
+        else { LAUNCH_STORE(FLASH_HDIM_512); }
 #undef LAUNCH_STORE
 #undef HALF
     }
@@ -1300,14 +1327,14 @@ extern "C" void call_flash_tq3_store(
 #define HALF __nv_bfloat16
         dim3 grid(num_tokens, num_kv_heads);
 #define LAUNCH_STORE(HD) \
-            flash_tq3_store_##HD<HALF><<<grid, 32, 0, s>>>( \
+            FLASH_CONCAT(flash_tq3_store_, HD)<HALF><<<grid, 32, 0, s>>>( \
                 (const HALF*)K, (const HALF*)V, \
                 (float*)K_absmax, (unsigned char*)K_quant, \
                 (float*)V_absmax, (unsigned char*)V_quant, \
                 slot_mapping, num_tokens, num_kv_heads, head_dim, block_size)
         if (head_dim <= 128) { LAUNCH_STORE(128); }
         else if (head_dim <= 256) { LAUNCH_STORE(256); }
-        else { LAUNCH_STORE(512); }
+        else { LAUNCH_STORE(FLASH_HDIM_512); }
 #undef LAUNCH_STORE
 #undef HALF
     }
@@ -1334,7 +1361,7 @@ extern "C" void call_flash_tq3_decode(
 #define HALF __half
         dim3 grid(num_q_heads, num_seqs);
 #define LAUNCH_DECODE(HD) \
-            flash_tq3_decode_##HD<HALF><<<grid, 256, 0, s>>>( \
+            FLASH_CONCAT(flash_tq3_decode_, HD)<HALF><<<grid, 256, 0, s>>>( \
                 (const HALF*)Q, \
                 (const float*)K_absmax, (const unsigned char*)K_quant, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
@@ -1343,7 +1370,7 @@ extern "C" void call_flash_tq3_decode(
                 inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window)
         if (head_dim <= 128) { LAUNCH_DECODE(128); }
         else if (head_dim <= 256) { LAUNCH_DECODE(256); }
-        else { LAUNCH_DECODE(512); }
+        else { LAUNCH_DECODE(FLASH_HDIM_512); }
 #undef LAUNCH_DECODE
 #undef HALF
     }
@@ -1352,7 +1379,7 @@ extern "C" void call_flash_tq3_decode(
 #define HALF __nv_bfloat16
         dim3 grid(num_q_heads, num_seqs);
 #define LAUNCH_DECODE(HD) \
-            flash_tq3_decode_##HD<HALF><<<grid, 256, 0, s>>>( \
+            FLASH_CONCAT(flash_tq3_decode_, HD)<HALF><<<grid, 256, 0, s>>>( \
                 (const HALF*)Q, \
                 (const float*)K_absmax, (const unsigned char*)K_quant, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
@@ -1361,7 +1388,7 @@ extern "C" void call_flash_tq3_decode(
                 inv_sqrt_d, num_seqs, q_stride, softcap, sliding_window)
         if (head_dim <= 128) { LAUNCH_DECODE(128); }
         else if (head_dim <= 256) { LAUNCH_DECODE(256); }
-        else { LAUNCH_DECODE(512); }
+        else { LAUNCH_DECODE(FLASH_HDIM_512); }
 #undef LAUNCH_DECODE
 #undef HALF
     }
@@ -1388,7 +1415,7 @@ extern "C" void call_flash_tq3_decode_splitk(
 #define HALF __half
         dim3 grid(num_q_heads, num_splits, num_seqs);
 #define LAUNCH_DECODE_SK(HD) \
-            flash_tq3_decode_splitk_##HD<HALF><<<grid, 256, 0, s>>>( \
+            FLASH_CONCAT(flash_tq3_decode_splitk_, HD)<HALF><<<grid, 256, 0, s>>>( \
                 (const HALF*)Q, \
                 (const float*)K_absmax, (const unsigned char*)K_quant, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (float*)workspace, \
@@ -1397,7 +1424,7 @@ extern "C" void call_flash_tq3_decode_splitk(
                 inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, sliding_window)
         if (head_dim <= 128) { LAUNCH_DECODE_SK(128); }
         else if (head_dim <= 256) { LAUNCH_DECODE_SK(256); }
-        else { LAUNCH_DECODE_SK(512); }
+        else { LAUNCH_DECODE_SK(FLASH_HDIM_512); }
 #undef LAUNCH_DECODE_SK
 #undef HALF
     }
@@ -1406,7 +1433,7 @@ extern "C" void call_flash_tq3_decode_splitk(
 #define HALF __nv_bfloat16
         dim3 grid(num_q_heads, num_splits, num_seqs);
 #define LAUNCH_DECODE_SK(HD) \
-            flash_tq3_decode_splitk_##HD<HALF><<<grid, 256, 0, s>>>( \
+            FLASH_CONCAT(flash_tq3_decode_splitk_, HD)<HALF><<<grid, 256, 0, s>>>( \
                 (const HALF*)Q, \
                 (const float*)K_absmax, (const unsigned char*)K_quant, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (float*)workspace, \
@@ -1415,7 +1442,7 @@ extern "C" void call_flash_tq3_decode_splitk(
                 inv_sqrt_d, num_splits, num_seqs, q_stride, softcap, sliding_window)
         if (head_dim <= 128) { LAUNCH_DECODE_SK(128); }
         else if (head_dim <= 256) { LAUNCH_DECODE_SK(256); }
-        else { LAUNCH_DECODE_SK(512); }
+        else { LAUNCH_DECODE_SK(FLASH_HDIM_512); }
 #undef LAUNCH_DECODE_SK
 #undef HALF
     }
@@ -1444,7 +1471,7 @@ extern "C" void call_flash_tq3_prefill(
         unsigned int br = 32;
         dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
 #define LAUNCH_PREFILL(HD, THREADS, SMEM) \
-            flash_tq3_prefill_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+            FLASH_CONCAT(flash_tq3_prefill_, HD)<HALF><<<grid, THREADS, SMEM, s>>>( \
                 (const HALF*)Q, \
                 (const float*)K_absmax, (const unsigned char*)K_quant, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
@@ -1468,19 +1495,20 @@ extern "C" void call_flash_tq3_prefill(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(256, 128, smem);
         } else {
+#if defined(FLASH_SM70_NO_HDIM512)
             // HDIM 512 is not compiled on Volta: it needs 101120 B of
             // dynamic shared memory, more than SM70's 64 KB opt-in limit.
             // Fall through to the HDIM 256 kernel instead.
-        #if !defined(FLASH_SM70_NO_HDIM512)
+            unsigned int smem = (32*264 + tq3_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            LAUNCH_PREFILL(FLASH_HDIM_512, 128, smem);
+#else
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq3_prefill_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(512, 256, smem);
-        #else
-            smem = 0;
-            LAUNCH_PREFILL(256, 128, smem);
-        #endif
+#endif
         }
 #undef LAUNCH_PREFILL
 #undef HALF
@@ -1491,7 +1519,7 @@ extern "C" void call_flash_tq3_prefill(
         unsigned int br = 32;
         dim3 grid(num_q_heads, (max_q_len + br - 1) / br, num_seqs);
 #define LAUNCH_PREFILL(HD, THREADS, SMEM) \
-            flash_tq3_prefill_##HD<HALF><<<grid, THREADS, SMEM, s>>>( \
+            FLASH_CONCAT(flash_tq3_prefill_, HD)<HALF><<<grid, THREADS, SMEM, s>>>( \
                 (const HALF*)Q, \
                 (const float*)K_absmax, (const unsigned char*)K_quant, \
                 (const float*)V_absmax, (const unsigned char*)V_quant, (HALF*)O, \
@@ -1515,19 +1543,20 @@ extern "C" void call_flash_tq3_prefill(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(256, 128, smem);
         } else {
+#if defined(FLASH_SM70_NO_HDIM512)
             // HDIM 512 is not compiled on Volta: it needs 101120 B of
             // dynamic shared memory, more than SM70's 64 KB opt-in limit.
             // Fall through to the HDIM 256 kernel instead.
-        #if !defined(FLASH_SM70_NO_HDIM512)
+            unsigned int smem = (32*264 + tq3_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
+            LAUNCH_PREFILL(FLASH_HDIM_512, 128, smem);
+#else
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq3_prefill_512<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL(512, 256, smem);
-        #else
-            smem = 0;
-            LAUNCH_PREFILL(256, 128, smem);
-        #endif
+#endif
         }
 #undef LAUNCH_PREFILL
 #undef HALF
