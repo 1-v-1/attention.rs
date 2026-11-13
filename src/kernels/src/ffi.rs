@@ -3094,7 +3094,7 @@ extern "C" {
         weight: *const u8,
         weight_scale: *const u8,
         weight_out: *mut u32,
-        scale_out: *mut u32,
+        scale_out: *mut u16,
         column_global_scale: *const f32,
         global_scale: f32,
         n: c_int,
@@ -3106,7 +3106,7 @@ extern "C" {
     pub fn nvfp4_matmul_hmma884_f16(
         input: *const c_void,
         weight: *const u32,
-        weight_scale: *const u32,
+        weight_scale: *const u16,
         weight_global_scale: f32,
         weight_row_scales: *const f32,
         bias: *const c_void,

@@ -816,7 +816,7 @@ pub fn nvfp4_matmul(
 
                 let input_ptr = cuda_ptr(&input_s, dtype)? as *const std::ffi::c_void;
                 let weight_ptr = cuda_ptr(&ws, DType::U32)? as *const u32;
-                let scale_ptr = cuda_ptr(&wss, DType::U32)? as *const u32;
+                let scale_ptr = cuda_ptr(&wss, DType::F16)? as *const u16;
                 let output_ptr = cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void;
 
                 let bias_ptr = if let Some(b) = bias {
@@ -1490,8 +1490,10 @@ pub fn nvfp4_repack_weight_sm70(
     let weight_out = Tensor::zeros((n, k / 8), DType::U32, dev)?;
     // One scale per NVFP4 group (16 elements along k), stored as half.
     // Storing one scale per weight word (8 elements) would duplicate every
-    // scale, which costs gigabytes on a 27B model.
-    let scale_out = Tensor::zeros((n, k / 16), DType::U32, dev)?;
+    // scale, which costs gigabytes on a 27B model.  The scale is a plain
+    // half rather than a half inside a u32: the u32 form would waste half
+    // of the storage, which is another gigabyte per card on a 27B model.
+    let scale_out = Tensor::zeros((n, k / 16), DType::F16, dev)?;
 
     let pointers = {
     let (ws, _) = weight.storage_and_layout();
@@ -1519,7 +1521,7 @@ pub fn nvfp4_repack_weight_sm70(
     };
     let scale_out_ptr = match &*so {
         candle_core::Storage::Cuda(c) => {
-            *c.as_cuda_slice::<u32>()?.device_ptr() as *mut u32
+            *c.as_cuda_slice::<u16>()?.device_ptr() as *mut u16
         }
         _ => candle_core::bail!("scale_out must be on CUDA"),
     };
@@ -1644,7 +1646,7 @@ pub fn nvfp4_matmul_hmma884(
     };
     let scale_ptr = match &*wss {
         candle_core::Storage::Cuda(c) => {
-            *c.as_cuda_slice::<u32>()?.device_ptr() as *const u32
+            *c.as_cuda_slice::<u16>()?.device_ptr() as *const u16
         }
         _ => candle_core::bail!("weight_scale must be on CUDA"),
     };

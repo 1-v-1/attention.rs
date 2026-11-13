@@ -199,7 +199,9 @@ __device__ __forceinline__ void mma_m8n8k4_row_col(float *d, const uint32_t *a,
 // The scale tensor is repacked at the same time: it is [N, K/16] FP8 E4M3
 // bytes, one scale per 16 elements of k.  The kernel needs the scale as a
 // half2 broadcast, so the packer converts E4M3 to half once and stores
-// [N, K/16] uint32 holding the half bits in both halves.
+// [N, K/16] half.  Storing the half in a uint32 would waste half of the
+// storage: on a 27B model the scale tensor is over a gigabyte per card,
+// so it is kept as a plain half.
 // ---------------------------------------------------------------------------
 
 // `column_global_scale` is the per-output-column global scale.  It is NULL
@@ -212,7 +214,7 @@ __device__ __forceinline__ void mma_m8n8k4_row_col(float *d, const uint32_t *a,
 // tensor-wide one otherwise, and this kernel has to agree with it exactly.
 __global__ void nvfp4_repack_weight_sm70_kernel(
     const uint8_t *__restrict__ weight, const uint8_t *__restrict__ weight_scale,
-    uint32_t *__restrict__ weight_out, uint32_t *__restrict__ scale_out,
+    uint32_t *__restrict__ weight_out, __half *__restrict__ scale_out,
     const float *__restrict__ column_global_scale, float global_scale, int N,
     int K) {
   // One thread per (n, 16-element scale group).
@@ -267,13 +269,9 @@ __global__ void nvfp4_repack_weight_sm70_kernel(
       dispatch_fp8_to_float(weight_scale[(size_t)n * (K / 16) + group]) *
       gscale;
   const __half h = __float2half(sf);
-  // Copy the two bytes of the half.  Reading four bytes through a
-  // `uint32_t *` would pull in two bytes of uninitialised stack, and the
-  // upper half of the result would depend on whatever happened to be there.
-  uint32_t hb;
-  memcpy(&hb, &h, sizeof(h));
-  hb &= 0xFFFFu;
-  scale_out[idx] = hb;
+  // The scale is a plain half: the GEMM kernel broadcasts it into both halves
+  // of the shared-memory entry when it loads it.
+  scale_out[idx] = h;
 }
 
 // ---------------------------------------------------------------------------
@@ -337,7 +335,7 @@ template <typename T, int kTileK, int kWarps>
 __launch_bounds__(SM70_NVFP4_WARP_SIZE * kWarps) __global__
     void nvfp4_sm70_hmma884_kernel(const T *__restrict__ input,
                                     const uint32_t *__restrict__ weight,
-                                    const uint32_t *__restrict__ weight_scale,
+                                    const __half *__restrict__ weight_scale,
                                     const float *__restrict__ weight_row_scales,
                                     const T *__restrict__ bias,
                                     T *__restrict__ output, int M, int N,
@@ -438,14 +436,15 @@ __launch_bounds__(SM70_NVFP4_WARP_SIZE * kWarps) __global__
       // `k_tile` counts weight words (eight elements each); a scale group
       // covers two words.
       const int ggroup = k_tile / 2 + v * kSVec;
-      // Each global scale is one uint32 with the half in the low half, so
-      // four of them make one uint4.
-      uint4 raw = make_uint4(0, 0, 0, 0);
+      // The global scales are halves, so four of them make one uint2.  The
+      // shared tile still holds the half2 form, which the kernel broadcasts
+      // to both halves when it loads it.
+      uint2 raw = make_uint2(0, 0);
       if (gcol < N && ggroup + kSVec <= scale_blocks) {
-        raw = __ldg(reinterpret_cast<const uint4 *>(
+        raw = __ldg(reinterpret_cast<const uint2 *>(
             &weight_scale[(size_t)gcol * scale_blocks + ggroup]));
       } else if (gcol < N && ggroup < scale_blocks) {
-        uint32_t *tp = reinterpret_cast<uint32_t *>(&raw);
+        __half *tp = reinterpret_cast<__half *>(&raw);
         for (int j = 0; j < kSVec; ++j)
           if (ggroup + j < scale_blocks)
             tp[j] = __ldg(&weight_scale[(size_t)gcol * scale_blocks + ggroup + j]);
@@ -453,12 +452,14 @@ __launch_bounds__(SM70_NVFP4_WARP_SIZE * kWarps) __global__
       uint32_t *dst = reinterpret_cast<uint32_t *>(sdst + c * (kTileK / 8));
       // The group index counts 16-element groups, and each group fills two
       // shared entries (the two weight words of the group).
-      const uint32_t *rawp = reinterpret_cast<const uint32_t *>(&raw);
+      const __half *rawp = reinterpret_cast<const __half *>(&raw);
 #pragma unroll
       for (int j = 0; j < kSVec; ++j) {
         const int g = v * kSVec + j;
         if (g >= groups_per_col) break;
-        const uint32_t hb = rawp[j] & 0xFFFFu;
+        // The shared entry is a half2 that carries the scale in both halves.
+        uint32_t hb;
+        memcpy(&hb, &rawp[j], sizeof(__half));
         dst[g * kSGroups] = hb | (hb << 16);
         dst[g * kSGroups + 1] = hb | (hb << 16);
       }
@@ -607,7 +608,7 @@ __launch_bounds__(SM70_NVFP4_WARP_SIZE * kWarps) __global__
 extern "C" void nvfp4_repack_weight_sm70(const uint8_t *weight,
                                           const uint8_t *weight_scale,
                                           uint32_t *weight_out,
-                                          uint32_t *scale_out,
+                                          __half *scale_out,
                                           const float *column_global_scale,
                                           float global_scale, int N, int K,
                                           cudaStream_t stream) {
@@ -653,7 +654,7 @@ extern "C" void nvfp4_repack_weight_sm70(const uint8_t *weight,
 // grid is small.
 template <int kTileK, int kWarps>
 static void launch_hmma884(const __half *input, const uint32_t *weight,
-                            const uint32_t *weight_scale,
+                            const __half *weight_scale,
                             const float *weight_row_scales, const __half *bias,
                             __half *output, int M, int N, int K, bool has_bias,
                             cudaStream_t stream) {
@@ -690,7 +691,7 @@ static void launch_hmma884(const __half *input, const uint32_t *weight,
 // The warp count follows the grid size: a V100 has 80 SMs, so a CTA of two
 // warps only pays off when it still leaves enough CTAs to fill the GPU.
 static void launch_hmma884_auto(const __half *input, const uint32_t *weight,
-                                const uint32_t *weight_scale,
+                                const __half *weight_scale,
                                 const float *weight_row_scales,
                                 const __half *bias, __half *output, int M, int N,
                                 int K, bool has_bias, cudaStream_t stream) {
@@ -728,7 +729,7 @@ static void launch_hmma884_auto(const __half *input, const uint32_t *weight,
 // that the host API matches the other NVFP4 entry points.
 extern "C" void nvfp4_matmul_hmma884_f16(const __half *input,
                                           const uint32_t *weight,
-                                          const uint32_t *weight_scale,
+                                          const __half *weight_scale,
                                           float weight_global_scale,
                                           const float *weight_row_scales,
                                           const __half *bias, __half *output,
