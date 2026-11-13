@@ -471,7 +471,7 @@ impl FlashInferDecodeWithPlan {
         q: &CudaStorage,
         q_l: &Layout,
     ) -> Result<(CudaStorage, candle::Shape)> {
-        let cuda_dev = q.device();
+        let dev = q.device();
         let (batch_size, _, _) = q_l.shape().dims3()?;
         if self.num_kv_heads == 0 || self.num_qo_heads % self.num_kv_heads != 0 {
             candle::bail!(
@@ -481,18 +481,18 @@ impl FlashInferDecodeWithPlan {
             );
         }
         let group_size = self.num_qo_heads / self.num_kv_heads;
-        if !is_supported_flashinfer_decode_group_size(&cuda_dev, group_size) {
+        if !is_supported_flashinfer_decode_group_size(&dev, group_size) {
             candle::bail!(
                 "flashinfer decode only supports gqa group_size in {:?}, got {}",
-                flashinfer_group_size_set(&cuda_dev),
+                flashinfer_group_size_set(&dev),
                 group_size
             );
         }
-        if !is_supported_flashinfer_head_dim(&cuda_dev, self.head_dim) {
+        if !is_supported_flashinfer_head_dim(&dev, self.head_dim) {
             candle::bail!(
                 "flashinfer decode head_dim={} is not compiled for this device; supported: {:?}",
                 self.head_dim,
-                flashinfer_head_dim_set(&cuda_dev)
+                flashinfer_head_dim_set(&dev)
             );
         }
         if !is_supported_flashinfer_decode_shape(group_size, self.head_dim) {
@@ -1103,12 +1103,12 @@ impl FlashInferPrefillWithPlan {
         q: &CudaStorage,
         q_l: &Layout,
     ) -> Result<(CudaStorage, candle::Shape)> {
-        let cuda_dev = q.device();
-        if !is_supported_flashinfer_head_dim(&cuda_dev, self.head_dim) {
+        let dev = q.device();
+        if !is_supported_flashinfer_head_dim(&dev, self.head_dim) {
             candle::bail!(
                 "flashinfer prefill head_dim={} is not compiled for this device; supported: {:?}",
                 self.head_dim,
-                flashinfer_head_dim_set(&cuda_dev)
+                flashinfer_head_dim_set(&dev)
             );
         }
 
@@ -1454,7 +1454,7 @@ impl FlashInferRaggedPrefill {
         q: &CudaStorage,
         q_l: &Layout,
     ) -> Result<(CudaStorage, candle::Shape)> {
-        let cuda_dev = q.device();
+        let dev = q.device();
         if self.num_kv_heads == 0 || self.num_qo_heads % self.num_kv_heads != 0 {
             candle::bail!(
                 "invalid flashinfer ragged prefill head config: qo_heads={} kv_heads={}",
@@ -1463,17 +1463,17 @@ impl FlashInferRaggedPrefill {
             );
         }
         let group_size = self.num_qo_heads / self.num_kv_heads;
-        if !is_supported_flashinfer_head_dim(&cuda_dev, self.head_dim) {
+        if !is_supported_flashinfer_head_dim(&dev, self.head_dim) {
             candle::bail!(
                 "flashinfer ragged prefill head_dim={} is not compiled for this device; supported: {:?}",
                 self.head_dim,
-                flashinfer_head_dim_set(&cuda_dev)
+                flashinfer_head_dim_set(&dev)
             );
         }
-        if !is_supported_flashinfer_gqa_group_size(&cuda_dev, group_size) {
+        if !is_supported_flashinfer_gqa_group_size(&dev, group_size) {
             candle::bail!(
                 "flashinfer ragged prefill only supports gqa group_size in {:?}, got {}",
-                flashinfer_group_size_set(&cuda_dev),
+                flashinfer_group_size_set(&dev),
                 group_size
             );
         }
