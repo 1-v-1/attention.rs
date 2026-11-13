@@ -456,17 +456,18 @@ extern "C" void call_flash_prefill_paged(
                 block_tables, block_table_stride, cu_seqlens_q, context_lens, \
                 num_q_heads, num_kv_heads, head_dim, cache_block_size, \
                 sliding_window, causal, inv_sqrt_d, softcap)
+#ifdef NO_BF16_KERNEL
+            const unsigned int paged_k_buffers = 1;
+#else
+            const unsigned int paged_k_buffers = 2;
+#endif
+
         if (head_dim <= 128) {
             LAUNCH_PREFILL(128, 128, 0);
         } else if (head_dim <= 256) {
             // SM70/SM75 cap the opt-in dynamic shared-memory allocation at
             // 64 KB; the double-buffered layout needs 70400 B.  PAGED_K_BUFFERS
             // is 1 there, which brings the requirement down to 52224 B.
-#ifdef NO_BF16_KERNEL
-            const unsigned int paged_k_buffers = 1;
-#else
-            const unsigned int paged_k_buffers = 2;
-#endif
             unsigned int smem = (32*264 + paged_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_256<HALF>,
@@ -502,17 +503,18 @@ extern "C" void call_flash_prefill_paged(
                 block_tables, block_table_stride, cu_seqlens_q, context_lens, \
                 num_q_heads, num_kv_heads, head_dim, cache_block_size, \
                 sliding_window, causal, inv_sqrt_d, softcap)
+#ifdef NO_BF16_KERNEL
+            const unsigned int paged_k_buffers = 1;
+#else
+            const unsigned int paged_k_buffers = 2;
+#endif
+
         if (head_dim <= 128) {
             LAUNCH_PREFILL(128, 128, 0);
         } else if (head_dim <= 256) {
             // SM70/SM75 cap the opt-in dynamic shared-memory allocation at
             // 64 KB; the double-buffered layout needs 70400 B.  PAGED_K_BUFFERS
             // is 1 there, which brings the requirement down to 52224 B.
-#ifdef NO_BF16_KERNEL
-            const unsigned int paged_k_buffers = 1;
-#else
-            const unsigned int paged_k_buffers = 2;
-#endif
             unsigned int smem = (32*264 + paged_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_256<HALF>,
@@ -567,30 +569,30 @@ extern "C" void call_flash_prefill_paged_fp8(
                 num_q_heads, num_kv_heads, head_dim, cache_block_size, \
                 sliding_window, causal, inv_sqrt_d, softcap, \
                 k_scale_ptr, v_scale_ptr, fp8_cache_stride)
+#ifdef NO_BF16_KERNEL
+            const unsigned int fp8_k_buffers = 1;
+#else
+            const unsigned int fp8_k_buffers = 2;
+#endif
+
         if (head_dim <= 128) {
             LAUNCH_PREFILL_FP8(128, 128, 0);
         } else if (head_dim <= 256) {
             // SM70/SM75 cap the opt-in dynamic shared-memory allocation at
             // 64 KB; the double-buffered layout needs 70400 B.  FP8_K_BUFFERS
             // is 1 there, which brings the requirement down to 52224 B.
-#ifdef NO_BF16_KERNEL
-            const unsigned int fp8_k_buffers = 1;
-#else
-            const unsigned int fp8_k_buffers = 2;
-#endif
             unsigned int smem = (32*264 + fp8_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_fp8_256<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL_FP8(256, 128, smem);
         } else {
-            // HDIM 512 is not compiled on Volta: it needs 101120 B of
-            // dynamic shared memory, more than SM70's 64 KB opt-in limit.
-            // Fall through to the HDIM 256 kernel instead.
 #if defined(FLASH_SM70_NO_HDIM512)
             // HDIM 512 is not compiled on Volta: it needs 101120 B of
             // dynamic shared memory, more than SM70's 64 KB opt-in limit.
             // Fall through to the HDIM 256 kernel instead.
+            unsigned int smem = (32*264 + fp8_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
             LAUNCH_PREFILL_FP8(FLASH_HDIM_512, 128, smem);
 #else
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
@@ -615,30 +617,30 @@ extern "C" void call_flash_prefill_paged_fp8(
                 num_q_heads, num_kv_heads, head_dim, cache_block_size, \
                 sliding_window, causal, inv_sqrt_d, softcap, \
                 k_scale_ptr, v_scale_ptr, fp8_cache_stride)
+#ifdef NO_BF16_KERNEL
+            const unsigned int fp8_k_buffers = 1;
+#else
+            const unsigned int fp8_k_buffers = 2;
+#endif
+
         if (head_dim <= 128) {
             LAUNCH_PREFILL_FP8(128, 128, 0);
         } else if (head_dim <= 256) {
             // SM70/SM75 cap the opt-in dynamic shared-memory allocation at
             // 64 KB; the double-buffered layout needs 70400 B.  FP8_K_BUFFERS
             // is 1 there, which brings the requirement down to 52224 B.
-#ifdef NO_BF16_KERNEL
-            const unsigned int fp8_k_buffers = 1;
-#else
-            const unsigned int fp8_k_buffers = 2;
-#endif
             unsigned int smem = (32*264 + fp8_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_prefill_paged_fp8_256<HALF>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
             LAUNCH_PREFILL_FP8(256, 128, smem);
         } else {
-            // HDIM 512 is not compiled on Volta: it needs 101120 B of
-            // dynamic shared memory, more than SM70's 64 KB opt-in limit.
-            // Fall through to the HDIM 256 kernel instead.
 #if defined(FLASH_SM70_NO_HDIM512)
             // HDIM 512 is not compiled on Volta: it needs 101120 B of
             // dynamic shared memory, more than SM70's 64 KB opt-in limit.
             // Fall through to the HDIM 256 kernel instead.
+            unsigned int smem = (32*264 + fp8_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
+            smem = (smem + 255) & ~255u;
             LAUNCH_PREFILL_FP8(FLASH_HDIM_512, 128, smem);
 #else
             unsigned int smem = (32*512 + 32*512 + 32*512) * 2 + 32*40*2 + 32*2*4;
@@ -1201,6 +1203,12 @@ extern "C" void call_flash_tq4_prefill(
                 block_tables, block_table_stride, cu_seqlens_q, context_lens, \
                 num_q_heads, num_kv_heads, head_dim, cache_block_size, \
                 sliding_window, causal, inv_sqrt_d, softcap)
+#ifdef NO_BF16_KERNEL
+            const unsigned int k_buffers = 1;
+#else
+            const unsigned int k_buffers = 2;
+#endif
+
         if (head_dim <= 128) {
             LAUNCH_PREFILL(128, 128, 0);
         } else if (head_dim <= 256) {
@@ -1217,11 +1225,6 @@ extern "C" void call_flash_tq4_prefill(
             // asynchronous CUDA error that surfaces at the next NCCL
             // collective.  TQ4P_K_BUFFERS is 1 on those architectures, which
             // brings the requirement down to 52224 B.
-#ifdef NO_BF16_KERNEL
-            const unsigned int k_buffers = 1;
-#else
-            const unsigned int k_buffers = 2;
-#endif
             unsigned int smem = (32*264 + k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq4_prefill_256<HALF>,
@@ -1259,15 +1262,16 @@ extern "C" void call_flash_tq4_prefill(
                 block_tables, block_table_stride, cu_seqlens_q, context_lens, \
                 num_q_heads, num_kv_heads, head_dim, cache_block_size, \
                 sliding_window, causal, inv_sqrt_d, softcap)
-        if (head_dim <= 128) {
-            LAUNCH_PREFILL(128, 128, 0);
-        } else if (head_dim <= 256) {
-            // See the F16 branch above: SM70/SM75 need a single K buffer.
 #ifdef NO_BF16_KERNEL
             const unsigned int k_buffers = 1;
 #else
             const unsigned int k_buffers = 2;
 #endif
+
+        if (head_dim <= 128) {
+            LAUNCH_PREFILL(128, 128, 0);
+        } else if (head_dim <= 256) {
+            // See the F16 branch above: SM70/SM75 need a single K buffer.
             unsigned int smem = (32*264 + k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq4_prefill_256<HALF>,
@@ -1478,17 +1482,18 @@ extern "C" void call_flash_tq3_prefill(
                 block_tables, block_table_stride, cu_seqlens_q, context_lens, \
                 num_q_heads, num_kv_heads, head_dim, cache_block_size, \
                 sliding_window, causal, inv_sqrt_d, softcap)
+#ifdef NO_BF16_KERNEL
+            const unsigned int tq3_k_buffers = 1;
+#else
+            const unsigned int tq3_k_buffers = 2;
+#endif
+
         if (head_dim <= 128) {
             LAUNCH_PREFILL(128, 128, 0);
         } else if (head_dim <= 256) {
             // SM70/SM75 cap the opt-in dynamic shared-memory allocation at
             // 64 KB; the double-buffered layout needs 70400 B.  TQ3P_K_BUFFERS
             // is 1 there, which brings the requirement down to 52224 B.
-#ifdef NO_BF16_KERNEL
-            const unsigned int tq3_k_buffers = 1;
-#else
-            const unsigned int tq3_k_buffers = 2;
-#endif
             unsigned int smem = (32*264 + tq3_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq3_prefill_256<HALF>,
@@ -1526,17 +1531,18 @@ extern "C" void call_flash_tq3_prefill(
                 block_tables, block_table_stride, cu_seqlens_q, context_lens, \
                 num_q_heads, num_kv_heads, head_dim, cache_block_size, \
                 sliding_window, causal, inv_sqrt_d, softcap)
+#ifdef NO_BF16_KERNEL
+            const unsigned int tq3_k_buffers = 1;
+#else
+            const unsigned int tq3_k_buffers = 2;
+#endif
+
         if (head_dim <= 128) {
             LAUNCH_PREFILL(128, 128, 0);
         } else if (head_dim <= 256) {
             // SM70/SM75 cap the opt-in dynamic shared-memory allocation at
             // 64 KB; the double-buffered layout needs 70400 B.  TQ3P_K_BUFFERS
             // is 1 there, which brings the requirement down to 52224 B.
-#ifdef NO_BF16_KERNEL
-            const unsigned int tq3_k_buffers = 1;
-#else
-            const unsigned int tq3_k_buffers = 2;
-#endif
             unsigned int smem = (32*264 + tq3_k_buffers*32*264 + 32*264) * 2 + 32*40*2 + 32*2*4;
             smem = (smem + 255) & ~255u;
             cudaFuncSetAttribute(flash_tq3_prefill_256<HALF>,
