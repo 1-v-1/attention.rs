@@ -110,6 +110,15 @@ pub const WORKSPACE_REGIONS: WorkspaceRegions = WorkspaceRegions {
     },
 };
 
+/// The device memory one workspace slot occupies.
+///
+/// The caller needs this to reserve the right amount of VRAM: the buffer
+/// is allocated lazily on first use, so a caller that plans its allocations
+/// around the free memory has to know the size up front.
+pub fn workspace_gpu_bytes() -> usize {
+    WORKSPACE_FLOAT_SIZE + WORKSPACE_INT_SIZE
+}
+
 /// Returns the workspace regions after validating they don't overlap.
 pub fn workspace_regions() -> WorkspaceRegions {
     debug_assert!(
@@ -271,6 +280,16 @@ mod cuda {
         ws_cell.with(|ws| {
             let mut ws = ws.borrow_mut();
             let ordinal = dev.ordinal();
+
+            // On Volta the FlashInfer prefill kernels are not available --
+            // they need the `cp.async` of SM80 -- so the only consumer of
+            // the eager workspace is a prefill that never runs.  The slot
+            // would still take 384 MiB of VRAM per card, which on a 27B
+            // model on a 16 GB card is the difference between having a KV
+            // cache and having none at all.
+            if !for_cuda_graph && crate::cuda_utils::sm_version(dev) == Some(70) {
+                return Ok((std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0));
+            }
 
             let needs_init = match ws.as_ref() {
                 None => true,
