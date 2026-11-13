@@ -9,8 +9,8 @@ use candle_core::{CudaStorage, DType, Layout, Result, Storage, Tensor};
 // Re-export workspace functions and constants for backward compatibility with external callers
 #[allow(unused_imports)]
 pub(crate) use crate::workspace::{
-    get_gemm_scratch_workspace, get_or_init_workspace, get_plan_workspace, GEMM_SCRATCH_FLOAT_SIZE,
-    WORKSPACE_FLOAT_SIZE,
+    ensure_int_capacity, get_gemm_scratch_workspace, get_or_init_workspace, get_plan_workspace,
+    GEMM_SCRATCH_FLOAT_SIZE, WORKSPACE_FLOAT_SIZE,
 };
 
 /// The group sizes the compiled kernels cover on this device.
@@ -775,7 +775,7 @@ pub fn decode_plan(
             )
         };
         if needed > 0 {
-            workspace::ensure_int_capacity(dev, enable_cuda_graph, needed)?;
+            ensure_int_capacity(dev, enable_cuda_graph, needed)?;
         }
     }
 
