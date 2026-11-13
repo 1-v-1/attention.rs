@@ -361,12 +361,12 @@ __launch_bounds__(SM70_NVFP4_WARP_SIZE * kWarps) __global__
   const int act_row = (lane & 3) + ((lane >= 16) ? 4 : 0);
   const int warp_col0 = n_base + warp * kSm70ColumnsPerWarp;
 
-  float acc[4][8];
+  // The accumulator of one 884 atom.  The warp covers thirty-two output
+  // columns with a single atom, and every lane keeps the eight values of
+  // the C fragment that it owns.
+  float acc[8];
 #pragma unroll
-  for (int q = 0; q < 4; ++q) {
-#pragma unroll
-    for (int i = 0; i < 8; ++i) acc[q][i] = 0.0f;
-  }
+  for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
 
   const int words_per_row = K / 8;   // weight words per output column
   const int scale_blocks = K / 16;   // repacked scales per output column
@@ -501,12 +501,17 @@ __launch_bounds__(SM70_NVFP4_WARP_SIZE * kWarps) __global__
     // layout
     //   row = (lane & 1) + (i & 2) + 4 * (lane >= 16)
     //   col = (lane & 2) + (i & 1) + 4 * ((i >> 2) & 1)
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-      // The B fragment: one column of the n-quad, eight contiguous k.
-      const int c_local =
-          warp * kSm70ColumnsPerWarp + q * 8 + (lane & 3) +
-          ((lane >= 16) ? 4 : 0);
+    // The B fragment of the 884 atom.  1Cat's reference layout
+    // (`benchmarks/csrc/sm70_raw_hmma_probe.cu`) picks the output column
+    // with
+    //   c = (lane & 12) * 2 + (lane & 3) + ((lane >> 4) * 4)
+    // so that the thirty-two lanes of the warp cover thirty-two distinct
+    // columns.  The C fragment then reads the result back from a
+    // different column map, which is what the hardware does.
+    const int b_col = (lane & 12) * 2 + (lane & 3) + ((lane >> 4) * 4);
+    {
+      // The B fragment: one column, eight contiguous k.
+      const int c_local = warp * kSm70ColumnsPerWarp + b_col;
       const uint32_t w = wsrc[c_local * Tile::kWordsPerKBlock + kb];
       const uint32_t s = ssrc[c_local * (kTileK / 8) + sidx];
 
@@ -535,7 +540,7 @@ __launch_bounds__(SM70_NVFP4_WARP_SIZE * kWarps) __global__
       float d[8];
       float c[8];
 #pragma unroll
-      for (int i = 0; i < 8; ++i) c[i] = acc[q][i];
+      for (int i = 0; i < 8; ++i) c[i] = acc[i];
       mma_m8n8k4_row_col(d, a_lo, b_lo, c);
       // The second atom accumulates on top of the first one.  The
       // accumulator of the first atom has to live in a separate register
@@ -546,7 +551,7 @@ __launch_bounds__(SM70_NVFP4_WARP_SIZE * kWarps) __global__
       for (int i = 0; i < 8; ++i) e[i] = d[i];
       mma_m8n8k4_row_col(d, a_hi, b_hi, e);
 #pragma unroll
-      for (int i = 0; i < 8; ++i) acc[q][i] = d[i];
+      for (int i = 0; i < 8; ++i) acc[i] = d[i];
     }
   };
 
@@ -582,27 +587,21 @@ __launch_bounds__(SM70_NVFP4_WARP_SIZE * kWarps) __global__
   // relative to the 8x8 tile of the n-quad.  The four redundant lane copies
   // write the same cells, so the stores are plain (not atomic) and they agree.
 #pragma unroll
-  for (int q = 0; q < 4; ++q) {
-    const int quad_base = warp_col0 + q * 8;
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      // The C fragment of the 884 atom.  1Cat's reference layout
-      // (`benchmarks/csrc/sm70_raw_hmma_probe.cu`) puts the row at
-      //   (lane & 1) + (reg & 2) + ((lane >> 4) * 4)
-      // and the column at
-      //   (lane & 12) * 2 + (lane & 2) + (reg & 4) + (reg & 1)
-      // The n-tile part `(lane & 12) * 2` selects one of the four eight
-      // column quads of the warp, and `reg & 4` the second half of it.
-      const int r = (lane & 1) + (i & 2) + 4 * ((lane >= 16) ? 1 : 0);
-      const int c = (lane & 2) + (i & 1) + 4 * ((i >> 2) & 1);
-      const int gcol = quad_base + c;
-      if (gcol >= N) continue;
-      const int grow = m_base + r;
-      if (grow >= M) continue;
-      float v = acc[q][i];
-      if (has_bias) v += __half2float(reinterpret_cast<const __half *>(bias)[gcol]);
-      output[(size_t)grow * N + gcol] = static_cast<T>(__float2half(v));
-    }
+  for (int i = 0; i < 8; ++i) {
+    // The C fragment of the 884 atom.  1Cat's reference layout
+    // (`benchmarks/csrc/sm70_raw_hmma_probe.cu`) puts the row at
+    //   (lane & 1) + (reg & 2) + ((lane >> 4) * 4)
+    // and the column at
+    //   (lane & 12) * 2 + (lane & 2) + (reg & 4) + (reg & 1)
+    const int r = (lane & 1) + (i & 2) + 4 * ((lane >= 16) ? 1 : 0);
+    const int c = (lane & 12) * 2 + (lane & 2) + (i & 4) + (i & 1);
+    const int gcol = warp_col0 + c;
+    if (gcol >= N) continue;
+    const int grow = m_base + r;
+    if (grow >= M) continue;
+    float v = acc[i];
+    if (has_bias) v += __half2float(reinterpret_cast<const __half *>(bias)[gcol]);
+    output[(size_t)grow * N + gcol] = static_cast<T>(__float2half(v));
   }
 }
 
