@@ -75,6 +75,13 @@ pub const WORKSPACE_FLOAT_SIZE: usize = FLASHINFER_PLAN_FLOAT_SIZE + GEMM_SCRATC
 /// Size of the int workspace buffer (128 MiB).
 pub const WORKSPACE_INT_SIZE: usize = 128 * 1024 * 1024;
 
+/// Size of the reduced float buffer used by the eager workspace on Volta.
+///
+/// The FlashInfer prefill kernels do not run on Volta, so the 256 MiB float
+/// buffer would be wasted.  The decode plan still needs some float scratch
+/// for the split-KV path, so the buffer is not dropped entirely.
+pub const SM70_EAGER_FLOAT_SIZE: usize = 8 * 1024 * 1024;
+
 /// Fallback workspace size when flashinfer is disabled.
 #[cfg(feature = "cuda")]
 pub const CUTLASS_WORKSPACE_FALLBACK_SIZE: usize = 512 * 1024 * 1024;
@@ -117,6 +124,14 @@ pub const WORKSPACE_REGIONS: WorkspaceRegions = WorkspaceRegions {
 /// around the free memory has to know the size up front.
 pub fn workspace_gpu_bytes() -> usize {
     WORKSPACE_FLOAT_SIZE + WORKSPACE_INT_SIZE
+}
+
+/// The device memory the reduced eager workspace occupies on Volta.
+///
+/// The eager slot keeps the int buffer and the page-locked host buffer, and
+/// only the float buffer is reduced.
+pub fn sm70_eager_workspace_gpu_bytes() -> usize {
+    SM70_EAGER_FLOAT_SIZE + WORKSPACE_INT_SIZE
 }
 
 /// Returns the workspace regions after validating they don't overlap.
@@ -211,6 +226,9 @@ mod cuda {
         pub int_buffer: CudaSlice<u8>,
         pub pinned_host: PinnedHostBuffer,
         pub device_ordinal: usize,
+        /// Size of the float buffer, which is smaller than the region table
+        /// on Volta.
+        pub float_size: usize,
     }
 
     /// Dedicated CUTLASS workspace, kept separate from FlashInfer buffers.
@@ -282,14 +300,32 @@ mod cuda {
             let ordinal = dev.ordinal();
 
             // On Volta the FlashInfer prefill kernels are not available --
-            // they need the `cp.async` of SM80 -- so the only consumer of
-            // the eager workspace is a prefill that never runs.  The slot
-            // would still take 384 MiB of VRAM per card, which on a 27B
-            // model on a 16 GB card is the difference between having a KV
-            // cache and having none at all.
-            if !for_cuda_graph && crate::cuda_utils::sm_version(dev) == Some(70) {
-                return Ok((std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0));
-            }
+            // they need the `cp.async` of SM80 -- so the prefill never runs
+            // and the eager float buffer would only be touched by the
+            // prefill plan.  The *decode* plan still needs the int buffer
+            // and the page-locked host buffer: without them the adapter
+            // gives up before it fills in the plan, the padded batch size
+            // stays zero and the decode kernel is launched with an empty
+            // grid, which fails with "invalid configuration argument".
+            //
+            // So the eager slot keeps the int buffer and the page-locked
+            // buffer, and only the float buffer is left out on Volta.  That
+            // saves 256 MiB per card, which on a 27B model on a 16 GB card is
+            // the difference between having a KV cache and having none.
+            let skip_float_buffer =
+                !for_cuda_graph && crate::cuda_utils::sm_version(dev) == Some(70);
+            // The decode plan still asks the float buffer for scratch when it
+            // splits the KV cache over several chunks, so the reduced buffer
+            // has to be big enough for that.  The split path needs
+            // `num_qo_heads * padded_batch_size * HEAD_DIM` floats for the
+            // partial results plus the same number of floats for the
+            // softmax statistics; a few megabytes cover the batch sizes a
+            // 16 GB card can hold.
+            let float_size = if skip_float_buffer {
+                SM70_EAGER_FLOAT_SIZE
+            } else {
+                WORKSPACE_FLOAT_SIZE
+            };
 
             let needs_init = match ws.as_ref() {
                 None => true,
@@ -297,7 +333,7 @@ mod cuda {
             };
 
             if needs_init {
-                let float_buffer = unsafe { dev.alloc::<u8>(WORKSPACE_FLOAT_SIZE) }.w()?;
+                let float_buffer = unsafe { dev.alloc::<u8>(float_size.max(1)) }.w()?;
                 let int_buffer = unsafe { dev.alloc::<u8>(WORKSPACE_INT_SIZE) }.w()?;
                 let pinned_host = PinnedHostBuffer::new(WORKSPACE_INT_SIZE)?;
                 *ws = Some(FlashInferWorkspace {
@@ -305,6 +341,7 @@ mod cuda {
                     int_buffer,
                     pinned_host,
                     device_ordinal: ordinal,
+                    float_size,
                 });
             }
 
@@ -359,14 +396,50 @@ mod cuda {
         let regions = workspace_regions();
         let (float_ptr, int_ptr, page_locked_ptr, page_locked_size) =
             get_or_init_workspace(dev, for_cuda_graph)?;
+        // The float buffer is smaller than the region on Volta, so the
+        // reported size has to be the size that was actually allocated.
+        let float_size = if float_ptr.is_null() {
+            0
+        } else {
+            float_buffer_size(dev, for_cuda_graph)
+        };
         Ok((
             add_workspace_offset(float_ptr, regions.plan_float),
-            regions.plan_float.size,
+            float_size,
             add_workspace_offset(int_ptr, regions.plan_int),
             regions.plan_int.size,
             page_locked_ptr,
             page_locked_size,
         ))
+    }
+
+    /// Returns the size of the float buffer that the eager or the graph
+    /// workspace actually allocated.
+    ///
+    /// The Volta eager slot uses a reduced buffer, so the size cannot be
+    /// taken from the region table.
+    fn float_buffer_size(
+        dev: &candle_core::cuda_backend::CudaDevice,
+        for_cuda_graph: bool,
+    ) -> usize {
+        let ws_cell = if for_cuda_graph {
+            &WORKSPACE_GRAPH
+        } else {
+            &WORKSPACE
+        };
+        ws_cell.with(|ws| {
+            let ws = ws.borrow();
+            match ws.as_ref() {
+                Some(existing) => {
+                    if existing.device_ordinal == dev.ordinal() {
+                        existing.float_size
+                    } else {
+                        0
+                    }
+                }
+                None => 0,
+            }
+        })
     }
 
     /// Returns the FlashInfer GEMM scratch region from the shared float buffer.
