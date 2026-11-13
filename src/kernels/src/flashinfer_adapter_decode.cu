@@ -368,6 +368,21 @@ void flashinfer_decode_run_wrapper(
                     tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
                 }
 
+                // Diagnostic: report the plan values that drive the launch
+                // configuration, so a launch failure can be traced to a
+                // concrete number instead of an opaque CUDA error.
+                static int diag_printed = 0;
+                if (diag_printed < 4) {
+                    diag_printed++;
+                    fprintf(stderr,
+                            "[flashinfer][decode] plan: pbs=%u split_kv=%d graph=%d "
+                            "qo=%u kv=%u hd=%u bs=%d\n",
+                            (unsigned)params.padded_batch_size, (int)plan_info.split_kv,
+                            (int)plan_info.enable_cuda_graph, (unsigned)num_qo_heads,
+                            (unsigned)num_kv_heads, (unsigned)head_dim, (int)batch_size);
+                    fflush(stderr);
+                }
+
                 BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kNone,
                         AttentionType, ParamsType>(
                         params, tmp_v, tmp_s, false, stream
@@ -430,6 +445,19 @@ void flashinfer_decode_run_wrapper(
             if (plan_info.split_kv) {
                 tmp_v = GetPtrFromBaseOffset<DTypeOut>(workspace_float, plan_info.v_offset);
                 tmp_s = GetPtrFromBaseOffset<float>(workspace_float, plan_info.s_offset);
+            }
+
+            // Diagnostic: see the note at the other call site.
+            static int diag_printed = 0;
+            if (diag_printed < 4) {
+                diag_printed++;
+                fprintf(stderr,
+                        "[flashinfer][decode] plan: pbs=%u split_kv=%d graph=%d "
+                        "qo=%u kv=%u hd=%u bs=%d\n",
+                        (unsigned)params.padded_batch_size, (int)plan_info.split_kv,
+                        (int)plan_info.enable_cuda_graph, (unsigned)num_qo_heads,
+                        (unsigned)num_kv_heads, (unsigned)head_dim, (int)batch_size);
+                fflush(stderr);
             }
 
             BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PosEncodingMode::kNone,
