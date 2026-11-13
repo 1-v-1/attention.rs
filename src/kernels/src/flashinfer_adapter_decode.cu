@@ -280,11 +280,6 @@ void flashinfer_decode_plan_wrapper(
                         plan_info_out[7] = plan_info.kv_chunk_size_ptr_offset;
                         plan_info_out[8] = plan_info.enable_cuda_graph;
                         plan_info_out[9] = plan_info.split_kv;
-                        // The number of bytes the plan actually carved out of
-                        // the int workspace.  The caller uses it to size the
-                        // allocation, so the buffer does not have to be a
-                        // fixed 128 MiB.
-                        plan_info_out[10] = static_cast<int64_t>(int_workspace_size_out);
                     }
                 });
             });
@@ -310,8 +305,6 @@ void flashinfer_decode_plan_wrapper(
                 using ParamsType = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
 
                 DecodePlanInfo plan_info;
-                size_t int_workspace_size_out = 0;
-                size_t float_workspace_size_out = 0;
                 DecodePlan<HEAD_DIM, PosEncodingMode::kNone, AttentionType, ParamsType>(
                     workspace_float, workspace_float_size,
                     workspace_int, page_locked_int_buffer, workspace_int_size,
@@ -333,7 +326,6 @@ void flashinfer_decode_plan_wrapper(
                     plan_info_out[7] = plan_info.kv_chunk_size_ptr_offset;
                     plan_info_out[8] = plan_info.enable_cuda_graph;
                     plan_info_out[9] = plan_info.split_kv;
-                    plan_info_out[10] = static_cast<int64_t>(int_workspace_size_out);
                 }
                 // Diagnostic: the plan values decide the launch geometry, and
                 // an empty grid is the only way the launch fails with
