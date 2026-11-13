@@ -12,6 +12,34 @@ use std::{
 #[cfg(feature = "cuda")]
 static SM_CACHE: OnceLock<Mutex<HashMap<usize, Option<i32>>>> = OnceLock::new();
 
+/// The compute capability of a device, without creating a context.
+///
+/// `cuDeviceGetAttribute` is one of the few driver calls that answer before
+/// a context exists, so this can be used from a process that must not
+/// occupy device memory -- the engine process, which only orchestrates the
+/// runners, would otherwise take a CUDA context on the first device and
+/// its footprint would compete with the model for VRAM.
+#[cfg(feature = "cuda")]
+pub fn sm_version_without_context(ordinal: i32) -> Option<i32> {
+    use candle_core::cuda_backend::cudarc::driver::result;
+    use candle_core::cuda_backend::WrapErr;
+
+    // The driver has to be initialised before any other call.
+    unsafe {
+        sys::lib().cu_init(0).w().ok()?;
+    }
+    let device = result::device::get(ordinal).ok()?;
+    let major = device
+        .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+        .w()
+        .ok()?;
+    let minor = device
+        .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+        .w()
+        .ok()?;
+    Some(major * 10 + minor)
+}
+
 #[cfg(feature = "cuda")]
 pub fn compute_capability(dev: &CudaDevice) -> Option<(i32, i32)> {
     let major = dev
