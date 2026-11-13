@@ -845,6 +845,33 @@ pub fn nvfp4_matmul(
                     );
                 }
 
+                // Diagnostic: the model produces NaN logits, so look at what
+                // this GEMM hands back.
+                {
+                    let mut nan = 0usize;
+                    let mut mn = f32::INFINITY;
+                    let mut mx = f32::NEG_INFINITY;
+                    let mut inf = 0usize;
+                    if let Ok(v) = output.to_dtype(DType::F32)?.to_vec1::<f32>() {
+                        for x in &v {
+                            if x.is_nan() {
+                                nan += 1;
+                            } else if x.is_infinite() {
+                                inf += 1;
+                            } else {
+                                mn = mn.min(*x);
+                                mx = mx.max(*x);
+                            }
+                        }
+                    }
+                    if nan > 0 || inf > 0 || mn < -1e4 || mx > 1e4 {
+                        eprintln!(
+                            "[diag][nvfp4-sm70] m={} n={} k={} nan={} inf={} min={} max={}",
+                            m, n, k, nan, inf, mn, mx
+                        );
+                    }
+                }
+
                 // Optional cross-check against the generic software dequant
                 // path.  Enabled with XINFER_NVFP4_SM70_CHECK=1; it doubles the
                 // work of every GEMM, so it is only meant for validation runs.
