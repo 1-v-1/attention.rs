@@ -852,7 +852,13 @@ pub fn nvfp4_matmul(
                     let mut mn = f32::INFINITY;
                     let mut mx = f32::NEG_INFINITY;
                     let mut inf = 0usize;
-                    if let Ok(v) = output.to_dtype(DType::F32)?.to_vec1::<f32>() {
+                    // The output is two dimensional, so it has to be
+                    // flattened before it can be read as a vector.
+                    if let Ok(v) = output
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()
+                    {
                         for x in &v {
                             if x.is_nan() {
                                 nan += 1;
