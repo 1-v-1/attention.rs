@@ -793,7 +793,6 @@ pub fn decode_plan(
             }
         );
     }
-
     let last_len_host = last_len_host
         .ok_or_else(|| candle_core::Error::msg("decode_plan requires last_len_host"))?;
     if last_len_host.len() != batch_size {
@@ -884,6 +883,12 @@ pub fn decode_plan(
         sm
     };
     validate_decode_plan_info(&plan_info, data_type, validate_sm)?;
+    if std::env::var("XINFER_DIAG_PLAN").is_ok() {
+        eprintln!(
+            "[diag][plan] graph={enable_cuda_graph} int={ws_int_ptr:?} pinned={page_locked_ptr:?} \
+             plan_info={plan_info:?}"
+        );
+    }
     Ok(plan_info)
 }
 
