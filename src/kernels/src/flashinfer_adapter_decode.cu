@@ -109,6 +109,18 @@ void flashinfer_append_kv_cache(
             (DType*)k_data_ptr, (DType*)v_data_ptr,
             paged_kv_indices, paged_kv_indptr, paged_kv_last_len
         );
+        if (getenv("XINFER_DIAG_APPEND") != nullptr) {
+            static int append_calls = 0;
+            if (append_calls < 6) {
+                append_calls++;
+                printf("[diag][append] nnz=%d batch_size=%d num_heads=%d head_dim=%d page_size=%d\n",
+                       nnz, batch_size, num_heads, head_dim, page_size);
+                printf("[diag][append] indptr[0]=%d indptr[1]=%d last_len[0]=%d indices[0]=%d indices[1]=%d\n",
+                       paged_kv_indptr[0], batch_size > 0 ? paged_kv_indptr[1] : -1,
+                       paged_kv_last_len[0], paged_kv_indices[0], paged_kv_indices[1]);
+                fflush(stdout);
+            }
+        }
         
         if (batch_size > 0 && batch_indices && positions) {
              size_t stride_n = num_heads * head_dim;
