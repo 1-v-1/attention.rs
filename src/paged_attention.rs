@@ -1305,12 +1305,34 @@ pub fn reshape_and_cache(
         let n = slot_mapping.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
         let ptr = |t: &Tensor| -> u64 {
             use candle::cuda_backend::cudarc::driver::DevicePtr;
-            let (s, _l) = t.storage_and_layout();
+            let (s, l) = t.storage_and_layout();
             match &*s {
-                Storage::Cuda(s) => s
-                    .as_cuda_slice::<u8>()
-                    .map(|sl| *sl.device_ptr() as u64)
-                    .unwrap_or(0),
+                Storage::Cuda(s) => {
+                    match t.dtype() {
+                        candle_core::DType::F16 => s
+                            .as_cuda_slice::<half::f16>()
+                            .map(|sl| *sl.device_ptr() as u64)
+                            .unwrap_or(0),
+                        candle_core::DType::BF16 => s
+                            .as_cuda_slice::<half::bf16>()
+                            .map(|sl| *sl.device_ptr() as u64)
+                            .unwrap_or(0),
+                        candle_core::DType::F32 => s
+                            .as_cuda_slice::<f32>()
+                            .map(|sl| *sl.device_ptr() as u64)
+                            .unwrap_or(0),
+                        candle_core::DType::I64 => s
+                            .as_cuda_slice::<i64>()
+                            .map(|sl| *sl.device_ptr() as u64)
+                            .unwrap_or(0),
+                        candle_core::DType::U8 => s
+                            .as_cuda_slice::<u8>()
+                            .map(|sl| *sl.device_ptr() as u64)
+                            .unwrap_or(0),
+                        _ => 0,
+                    }
+                    .wrapping_add(l.start_offset() as u64 * t.dtype().size_in_bytes() as u64)
+                }
                 _ => 0,
             }
         };
