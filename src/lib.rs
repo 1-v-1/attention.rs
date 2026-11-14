@@ -927,14 +927,32 @@ impl PagedAttention {
                             // means the graph writes into a different buffer.
                             use candle_core::cuda_backend::cudarc::driver::DevicePtr;
                             let ptr = |t: &Tensor| -> u64 {
-                                let (st, _l) = t.storage_and_layout();
-                                match &*st {
-                                    candle_core::Storage::Cuda(s) => s
-                                        .as_cuda_slice::<u8>()
-                                        .map(|sl| *sl.device_ptr() as u64)
-                                        .unwrap_or(0),
+                                let (st, l) = t.storage_and_layout();
+                                let base = match &*st {
+                                    candle_core::Storage::Cuda(s) => match t.dtype() {
+                                        candle_core::DType::F16 => s
+                                            .as_cuda_slice::<half::f16>()
+                                            .map(|sl| *sl.device_ptr() as u64)
+                                            .unwrap_or(0),
+                                        candle_core::DType::BF16 => s
+                                            .as_cuda_slice::<half::bf16>()
+                                            .map(|sl| *sl.device_ptr() as u64)
+                                            .unwrap_or(0),
+                                        candle_core::DType::F32 => s
+                                            .as_cuda_slice::<f32>()
+                                            .map(|sl| *sl.device_ptr() as u64)
+                                            .unwrap_or(0),
+                                        candle_core::DType::U32 => s
+                                            .as_cuda_slice::<u32>()
+                                            .map(|sl| *sl.device_ptr() as u64)
+                                            .unwrap_or(0),
+                                        _ => 0,
+                                    },
                                     _ => 0,
-                                }
+                                };
+                                base.wrapping_add(
+                                    l.start_offset() as u64 * t.dtype().size_in_bytes() as u64,
+                                )
                             };
                             eprintln!(
                                 "[diag][rac] kc={:#x} vc={:#x} slot_ptr={:#x} key={:#x}",
