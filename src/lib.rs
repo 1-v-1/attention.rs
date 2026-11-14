@@ -914,11 +914,19 @@ impl PagedAttention {
                         // and the last-page length.  Both compute the same
                         // slot, but only the native kernel keeps working when
                         // it is captured into a CUDA graph.
+                        // The slot mapping has to stay a *view* of the caller's
+                        // buffer.  Inside a CUDA graph the KV write kernel
+                        // reads the slot from device memory on every replay,
+                        // so a copy would freeze the slot at the value it had
+                        // when the graph was captured -- the decode step would
+                        // then keep writing to slot 0 and the cache would
+                        // never grow.  `cuda_fwd_t` only needs a 1-D tensor,
+                        // which `flatten_all` already gives us.
                         let slot = input_metadata.slot_mapping.flatten_all()?;
                         let slot = if slot.dtype() == candle_core::DType::I64 {
-                            slot.contiguous()?
+                            slot
                         } else {
-                            slot.to_dtype(candle_core::DType::I64)?.contiguous()?
+                            slot.to_dtype(candle_core::DType::I64)?
                         };
                         if std::env::var("XINFER_DIAG_RAC").is_ok() {
                             // Print the pointers the kernel actually gets.
