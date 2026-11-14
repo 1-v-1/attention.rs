@@ -119,6 +119,16 @@ __global__ void reshape_and_cache_flash_kernel(
   const int64_t block_idx = slot_idx / block_size;
   const int64_t block_offset = slot_idx % block_size;
   const int n = num_heads * head_size;
+  // Diagnostic: read back what we are about to write and the value that is
+  // currently stored in the *previous* slot of the same block.  The latter
+  // tells whether an earlier decode step's K/V survived until the next step.
+  if (token_idx == 0 && threadIdx.x == 0) {
+    const int64_t prev_off = block_offset > 0 ? block_offset - 1 : 0;
+    const int64_t prev_idx = block_idx * block_stride + prev_off * page_stride;
+    printf("[rac][w] slot=%ld block=%ld off=%ld prev_slot_val=%f src0=%f\n",
+           (long)slot_idx, (long)block_idx, (long)block_offset,
+           (float)key_cache[prev_idx], (float)key[0]);
+  }
   for (int i = threadIdx.x; i < n; i += blockDim.x) {
     const int64_t src_key_idx = token_idx * key_stride + i;
     const int64_t src_value_idx = token_idx * value_stride + i;
@@ -139,6 +149,12 @@ __global__ void reshape_and_cache_flash_kernel(
       value_cache[tgt_key_value_idx] =
           vllm::fp8::scaled_convert<cache_t, scalar_t>(tgt_value, v_scales[head_idx]);
     }
+  }
+  // Diagnostic: read the value back to prove the write landed in the cache.
+  if (token_idx == 0 && threadIdx.x == 0) {
+    const int64_t tgt = block_idx * block_stride + block_offset * page_stride;
+    printf("[rac][w2] slot=%ld tgt=%ld readback=%f\n", (long)slot_idx, (long)tgt,
+           (float)key_cache[tgt]);
   }
 }
 
