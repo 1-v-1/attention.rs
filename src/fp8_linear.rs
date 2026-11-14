@@ -243,12 +243,11 @@ fn fp8_matmul_channelwise(
     // warp per output column, striped over K) reaches 715 GB/s and is
     // bit-identical to the generic kernel for channel-wise scales.  Only
     // single-token decoding can use it.
-    let sm_version = input
-        .device()
-        .as_cuda_device()
-        .ok()
-        .and_then(crate::cuda_utils::sm_version)
-        .unwrap_or(0) as usize;
+    let sm_version = if let Ok(cuda_dev) = input.device().as_cuda_device() {
+        crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0) as usize
+    } else {
+        0
+    };
     if m == 1 && sm_version < 80 && input.dtype() == DType::F16 && (k & 15) == 0 {
         unsafe {
             ffi::fp8_gemv_sm70_f16(
