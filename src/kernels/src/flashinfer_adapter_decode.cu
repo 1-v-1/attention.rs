@@ -333,15 +333,33 @@ void flashinfer_decode_plan_wrapper(
                 static int plan_diag_printed = 0;
                 if (plan_diag_printed < 4) {
                     plan_diag_printed++;
+                    // kv_chunk_size lives in the page-locked int buffer; read it
+                    // back so a mismatch between the capture-time plan and the
+                    // replay-time plan is visible.
+                    uint32_t kv_chunk = 0;
+                    if (plan_info.kv_chunk_size_ptr_offset >= 0 &&
+                        (size_t)plan_info.kv_chunk_size_ptr_offset + sizeof(uint32_t) <=
+                            page_locked_int_size) {
+                        kv_chunk = *reinterpret_cast<const uint32_t*>(
+                            static_cast<const char*>(page_locked_int_buffer) +
+                            plan_info.kv_chunk_size_ptr_offset);
+                    }
                     fprintf(stderr,
                             "[flashinfer][decode_plan] pbs=%u split_kv=%d graph=%d bs=%d "
-                            "qo=%u kv=%u hd=%u page=%d indptr0=%d indptrN=%d\n",
+                            "qo=%u kv=%u hd=%u page=%d indptr0=%d indptrN=%d "
+                            "req_off=%lld kvtile_off=%lld o_indptr_off=%lld kvc_off=%lld "
+                            "kv_chunk=%u\n",
                             (unsigned)plan_info.padded_batch_size, (int)plan_info.split_kv,
                             (int)plan_info.enable_cuda_graph, (int)batch_size,
                             (unsigned)num_qo_heads, (unsigned)num_kv_heads,
                             (unsigned)head_dim, (int)page_size,
                             (int)indptr_host[0],
-                            (int)indptr_host[batch_size]);
+                            (int)indptr_host[batch_size],
+                            (long long)plan_info.request_indices_offset,
+                            (long long)plan_info.kv_tile_indices_offset,
+                            (long long)plan_info.o_indptr_offset,
+                            (long long)plan_info.kv_chunk_size_ptr_offset,
+                            (unsigned)kv_chunk);
                     fflush(stderr);
                 }
             });
