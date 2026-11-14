@@ -696,19 +696,19 @@ pub fn decode_plan(
     head_dim: usize,
     page_size: usize,
     enable_cuda_graph: bool,
-    /// Whether FlashInfer itself should build the plan in CUDA-graph mode.
-    ///
-    /// `enable_cuda_graph` selects the *workspace*; this selects FlashInfer's
-    /// own plan mode.  FlashInfer's CUDA-graph mode forces `split_kv=true`
-    /// and pads the batch to `max_grid_size/gdy`, which makes the number of
-    /// KV tiles per split depend on the KV length: a graph captured with a
-    /// long KV and replayed with a short one runs a different partition than
-    /// the plan describes.  The ordinary mode keeps `padded_batch_size ==
-    /// batch_size`, which is fixed for a captured graph and lets the kernel
-    /// follow the KV length on its own.
-    ///
-    /// `None` keeps the old behaviour (the same value as
-    /// `enable_cuda_graph`).
+    // Whether FlashInfer itself should build the plan in CUDA-graph mode.
+    //
+    // `enable_cuda_graph` selects the *workspace*; this selects FlashInfer's
+    // own plan mode.  FlashInfer's CUDA-graph mode forces `split_kv=true`
+    // and pads the batch to `max_grid_size/gdy`, which makes the number of
+    // KV tiles per split depend on the KV length: a graph captured with a
+    // long KV and replayed with a short one runs a different partition than
+    // the plan describes.  The ordinary mode keeps `padded_batch_size ==
+    // batch_size`, which is fixed for a captured graph and lets the kernel
+    // follow the KV length on its own.
+    //
+    // `None` keeps the old behaviour (the same value as
+    // `enable_cuda_graph`).
     flashinfer_graph_mode: Option<bool>,
 ) -> Result<Vec<i64>> {
     let dev = dev.as_cuda_device()?;
