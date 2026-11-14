@@ -777,6 +777,12 @@ pub fn decode_plan(
         if needed > 0 {
             ensure_int_capacity(dev, enable_cuda_graph, needed)?;
         }
+        if std::env::var("XINFER_DIAG_PLAN").is_ok() {
+            eprintln!(
+                "[diag][plan] need={needed} ordinal={} graph={enable_cuda_graph}",
+                dev.ordinal()
+            );
+        }
     }
 
     let (ws_float_ptr, ws_float_size, ws_int_ptr, ws_int_size, page_locked_ptr, page_locked_size) =
@@ -785,12 +791,13 @@ pub fn decode_plan(
         eprintln!(
             "[diag][plan] graph={enable_cuda_graph} float={ws_float_ptr:?}/{ws_float_size} \
              int={ws_int_ptr:?}/{ws_int_size} pinned={page_locked_ptr:?}/{page_locked_size} \
-             bs={batch_size} pages={}",
+             bs={batch_size} pages={} tid={:?}",
             if indptr_host.len() > 1 {
                 indptr_host[1] - indptr_host[0]
             } else {
                 0
-            }
+            },
+            std::thread::current().id()
         );
     }
     let last_len_host = last_len_host
