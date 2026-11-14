@@ -903,18 +903,31 @@ impl PagedAttention {
                     // its additional_params, so 1.0 scales are also fine there.
 
                     if let (Some(kc), Some(vc)) = (key_cache.as_ref(), value_cache.as_ref()) {
-                        crate::flashinfer::append_kv_cache(
+                        // Write the new token into the paged cache.
+                        //
+                        // The native `reshape_and_cache` kernel is used instead
+                        // of FlashInfer's `append_kv_cache`: its destination
+                        // is given directly by `slot_mapping`
+                        // (`slot = block_id * block_size + offset`), which is
+                        // refreshed on every graph replay, while FlashInfer's
+                        // kernel derives the destination from the page table
+                        // and the last-page length.  Both compute the same
+                        // slot, but only the native kernel keeps working when
+                        // it is captured into a CUDA graph.
+                        let slot = input_metadata.slot_mapping.flatten_all()?;
+                        let slot = if slot.dtype() == DType::I64 {
+                            slot.contiguous()?
+                        } else {
+                            slot.to_dtype(DType::I64)?.contiguous()?
+                        };
+                        reshape_and_cache(
                             &key,
                             &value,
                             kc,
                             vc,
                             self.k_scale.as_ref(),
                             self.v_scale.as_ref(),
-                            &fm.indices,
-                            &fm.indptr,
-                            &fm.last_len,
-                            fm.batch_indices.as_ref(),
-                            fm.positions.as_ref(),
+                            &slot,
                         )?;
                     }
 
