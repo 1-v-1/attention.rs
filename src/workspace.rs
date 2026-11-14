@@ -215,6 +215,18 @@ mod cuda {
         pub fn size(&self) -> usize {
             self.size
         }
+
+        /// A placeholder that owns nothing.
+        ///
+        /// Used to move the real buffer out of a workspace before it is
+        /// replaced, so that the old allocation can be kept alive instead of
+        /// being freed.
+        pub fn empty() -> Self {
+            Self {
+                ptr: std::ptr::null_mut(),
+                size: 0,
+            }
+        }
     }
 
     impl Drop for PinnedHostBuffer {
@@ -421,6 +433,16 @@ mod cuda {
     /// workspace.  The buffer is only reallocated when the plan asks for
     /// more than the slot currently holds, so the common case costs
     /// nothing.
+    ///
+    /// The old buffers are **never released**.  A CUDA graph that was
+    /// captured while the plan was materialised holds a `cudaMemcpyAsync`
+    /// node whose source is the *host* address of the page-locked buffer
+    /// (FlashInfer's `DecodePlanImpl` fills the page-locked buffer and then
+    /// copies it to the device).  Freeing that buffer would leave the graph
+    /// pointing at unmapped host memory, and every later `cuGraphLaunch`
+    /// would fail with `CUDA_ERROR_INVALID_VALUE`.  Keeping the old buffers
+    /// alive for the lifetime of the process costs a few megabytes and makes
+    /// the captured addresses permanently valid.
     pub fn ensure_int_capacity(
         dev: &candle_core::cuda_backend::CudaDevice,
         for_cuda_graph: bool,
@@ -449,6 +471,13 @@ mod cuda {
             let int_buffer = unsafe { dev.alloc::<u8>(target) }.w()?;
             let pinned_host = PinnedHostBuffer::new(target)?;
             let ordinal = dev.ordinal();
+            let old_int_buffer = ws
+                .as_ref()
+                .map(|w| w.int_buffer.clone())
+                .ok_or_else(|| candle_core::Error::msg("workspace has no int buffer"))?;
+            // Take the previous page-locked buffer out of the workspace so
+            // that it is not freed when the workspace is replaced.
+            let old_pinned_host = ws.as_mut().map(|w| std::mem::replace(&mut w.pinned_host, PinnedHostBuffer::empty()));
             *ws = Some(FlashInferWorkspace {
                 float_buffer: ws
                     .as_ref()
@@ -460,6 +489,13 @@ mod cuda {
                 float_size: ws.as_ref().map(|w| w.float_size).unwrap_or(0),
                 int_size: target,
             });
+            // Keep the previous generation alive on purpose: a captured CUDA
+            // graph refers to the host address of the page-locked buffer in
+            // its memcpy node, and to the device address of the int buffer.
+            std::mem::forget(old_int_buffer);
+            if let Some(old) = old_pinned_host {
+                std::mem::forget(old);
+            }
             Ok(())
         })
     }
