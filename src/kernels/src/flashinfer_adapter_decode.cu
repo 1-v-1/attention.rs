@@ -111,7 +111,7 @@ void flashinfer_append_kv_cache(
         );
         if (getenv("XINFER_DIAG_APPEND") != nullptr) {
             static int append_calls = 0;
-            if (append_calls < 6) {
+            if (append_calls < 200) {
                 append_calls++;
                 printf("[diag][append] nnz=%d batch_size=%d num_heads=%d head_dim=%d page_size=%d\n",
                        nnz, batch_size, num_heads, head_dim, page_size);
