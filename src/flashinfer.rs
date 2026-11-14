@@ -781,6 +781,18 @@ pub fn decode_plan(
 
     let (ws_float_ptr, ws_float_size, ws_int_ptr, ws_int_size, page_locked_ptr, page_locked_size) =
         get_plan_workspace(dev, enable_cuda_graph)?;
+    if std::env::var("XINFER_DIAG_PLAN").is_ok() {
+        eprintln!(
+            "[diag][plan] graph={enable_cuda_graph} float={ws_float_ptr:?}/{ws_float_size} \
+             int={ws_int_ptr:?}/{ws_int_size} pinned={page_locked_ptr:?}/{page_locked_size} \
+             bs={batch_size} pages={}",
+            if indptr_host.len() > 1 {
+                indptr_host[1] - indptr_host[0]
+            } else {
+                0
+            }
+        );
+    }
 
     let last_len_host = last_len_host
         .ok_or_else(|| candle_core::Error::msg("decode_plan requires last_len_host"))?;
