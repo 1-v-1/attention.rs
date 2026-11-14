@@ -696,8 +696,23 @@ pub fn decode_plan(
     head_dim: usize,
     page_size: usize,
     enable_cuda_graph: bool,
+    /// Whether FlashInfer itself should build the plan in CUDA-graph mode.
+    ///
+    /// `enable_cuda_graph` selects the *workspace*; this selects FlashInfer's
+    /// own plan mode.  FlashInfer's CUDA-graph mode forces `split_kv=true`
+    /// and pads the batch to `max_grid_size/gdy`, which makes the number of
+    /// KV tiles per split depend on the KV length: a graph captured with a
+    /// long KV and replayed with a short one runs a different partition than
+    /// the plan describes.  The ordinary mode keeps `padded_batch_size ==
+    /// batch_size`, which is fixed for a captured graph and lets the kernel
+    /// follow the KV length on its own.
+    ///
+    /// `None` keeps the old behaviour (the same value as
+    /// `enable_cuda_graph`).
+    flashinfer_graph_mode: Option<bool>,
 ) -> Result<Vec<i64>> {
     let dev = dev.as_cuda_device()?;
+    let flashinfer_graph_mode = flashinfer_graph_mode.unwrap_or(enable_cuda_graph);
     if num_kv_heads == 0 || num_qo_heads % num_kv_heads != 0 {
         candle::bail!(
             "invalid flashinfer decode head config: qo_heads={} kv_heads={}",
@@ -769,7 +784,7 @@ pub fn decode_plan(
                 num_kv_heads as i32,
                 head_dim as i32,
                 page_size as i32,
-                enable_cuda_graph,
+                flashinfer_graph_mode,
                 data_type,
                 sizes.as_mut_ptr(),
             )
@@ -848,7 +863,7 @@ pub fn decode_plan(
                 ws_int_size,
                 page_locked_ptr,
                 page_locked_size,
-                enable_cuda_graph,
+                flashinfer_graph_mode,
                 data_type,
                 out_data_type,
                 plan_info.as_mut_ptr(),
@@ -873,7 +888,7 @@ pub fn decode_plan(
                 ws_int_size,
                 page_locked_ptr,
                 page_locked_size,
-                enable_cuda_graph,
+                flashinfer_graph_mode,
                 data_type,
                 out_data_type,
                 plan_info.as_mut_ptr(),
@@ -892,7 +907,7 @@ pub fn decode_plan(
     validate_decode_plan_info(&plan_info, data_type, validate_sm)?;
     if std::env::var("XINFER_DIAG_PLAN").is_ok() {
         eprintln!(
-            "[diag][plan] graph={enable_cuda_graph} int={ws_int_ptr:?} pinned={page_locked_ptr:?} \
+            "[diag][plan] graph={enable_cuda_graph} fi_graph={flashinfer_graph_mode} int={ws_int_ptr:?} pinned={page_locked_ptr:?} \
              plan_info={plan_info:?}"
         );
     }
