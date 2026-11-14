@@ -108,6 +108,10 @@ __global__ void reshape_and_cache_flash_kernel(
   const bool is_quantized = !std::is_same<scalar_t, cache_t>::value;
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
+  if (token_idx == 0 && threadIdx.x == 0) {
+    printf("[rac][kernel] slot=%ld key_cache=%p value_cache=%p key=%p\n",
+           (long)slot_idx, (void*)key_cache, (void*)value_cache, (void*)key);
+  }
   // NOTE: slot_idx can be -1 if the token is padded
   if (slot_idx < 0) {
     return;
