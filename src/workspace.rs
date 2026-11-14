@@ -310,35 +310,35 @@ mod cuda {
         /// KV cache is never updated.
         #[cfg(feature = "flashinfer")]
         pub static WORKSPACE: std::cell::RefCell<HashMap<usize, FlashInferWorkspace>> =
-            const { std::cell::RefCell::new(HashMap::new()) };
+            std::cell::RefCell::new(HashMap::new());
 
         /// FlashInfer workspace for CUDA graph captures (separate to avoid interference).
         #[cfg(feature = "flashinfer")]
         pub static WORKSPACE_GRAPH: std::cell::RefCell<HashMap<usize, FlashInferWorkspace>> =
-            const { std::cell::RefCell::new(HashMap::new()) };
+            std::cell::RefCell::new(HashMap::new());
 
         /// Dedicated CUTLASS workspaces, split by execution domain so decode-graph
         /// and MTP/DFlash-verify-graph captures never alias the same device pointer.
         #[cfg(all(feature = "cuda", feature = "cutlass"))]
         pub static CUTLASS_WORKSPACE_EAGER: std::cell::RefCell<HashMap<usize, CutlassWorkspace>> =
-            const { std::cell::RefCell::new(HashMap::new()) };
+            std::cell::RefCell::new(HashMap::new());
         #[cfg(all(feature = "cuda", feature = "cutlass"))]
         pub static CUTLASS_WORKSPACE_DECODE_GRAPH: std::cell::RefCell<HashMap<usize, CutlassWorkspace>> =
-            const { std::cell::RefCell::new(HashMap::new()) };
+            std::cell::RefCell::new(HashMap::new());
         #[cfg(all(feature = "cuda", feature = "cutlass"))]
         pub static CUTLASS_WORKSPACE_MTP_GRAPH: std::cell::RefCell<HashMap<usize, CutlassWorkspace>> =
-            const { std::cell::RefCell::new(HashMap::new()) };
+            std::cell::RefCell::new(HashMap::new());
 
         /// Specialized FP8 blockscale workspace.
         #[cfg(feature = "flashinfer")]
         pub static FLASHINFER_FP8_WORKSPACE_EAGER: std::cell::RefCell<HashMap<usize, FlashInferFp8Workspace>> =
-            const { std::cell::RefCell::new(HashMap::new()) };
+            std::cell::RefCell::new(HashMap::new());
         #[cfg(feature = "flashinfer")]
         pub static FLASHINFER_FP8_WORKSPACE_DECODE_GRAPH: std::cell::RefCell<HashMap<usize, FlashInferFp8Workspace>> =
-            const { std::cell::RefCell::new(HashMap::new()) };
+            std::cell::RefCell::new(HashMap::new());
         #[cfg(feature = "flashinfer")]
         pub static FLASHINFER_FP8_WORKSPACE_MTP_GRAPH: std::cell::RefCell<HashMap<usize, FlashInferFp8Workspace>> =
-            const { std::cell::RefCell::new(HashMap::new()) };
+            std::cell::RefCell::new(HashMap::new());
     }
 
     /// Initializes or retrieves the FlashInfer workspace for the given device.
@@ -699,11 +699,11 @@ mod cuda {
     #[cfg(feature = "cutlass")]
     thread_local! {
         static NVFP4_HW_SCRATCH_EAGER: std::cell::RefCell<HashMap<usize, Nvfp4HwScratchPool>> =
-            const { std::cell::RefCell::new(HashMap::new()) };
+            std::cell::RefCell::new(HashMap::new());
         static NVFP4_HW_SCRATCH_DECODE_GRAPH: std::cell::RefCell<HashMap<usize, Nvfp4HwScratchPool>> =
-            const { std::cell::RefCell::new(HashMap::new()) };
+            std::cell::RefCell::new(HashMap::new());
         static NVFP4_HW_SCRATCH_MTP_GRAPH: std::cell::RefCell<HashMap<usize, Nvfp4HwScratchPool>> =
-            const { std::cell::RefCell::new(HashMap::new()) };
+            std::cell::RefCell::new(HashMap::new());
     }
 
     #[cfg(feature = "cutlass")]
@@ -855,7 +855,7 @@ mod cuda {
     #[cfg(feature = "cutlass")]
     thread_local! {
         pub static MOE_ACTIVATION_POOL: std::cell::RefCell<HashMap<usize, MoeActivationPool>> =
-            const { std::cell::RefCell::new(HashMap::new()) };
+            std::cell::RefCell::new(HashMap::new());
     }
 
     #[cfg(feature = "cutlass")]
@@ -1012,11 +1012,11 @@ mod cuda {
 
     thread_local! {
         static MLA_DECODE_WORKSPACE_EAGER: std::cell::RefCell<HashMap<usize, MlaDecodeWorkspace>> =
-            const { std::cell::RefCell::new(HashMap::new()) };
+            std::cell::RefCell::new(HashMap::new());
         static MLA_DECODE_WORKSPACE_DECODE_GRAPH: std::cell::RefCell<HashMap<usize, MlaDecodeWorkspace>> =
-            const { std::cell::RefCell::new(HashMap::new()) };
+            std::cell::RefCell::new(HashMap::new());
         static MLA_DECODE_WORKSPACE_MTP_GRAPH: std::cell::RefCell<HashMap<usize, MlaDecodeWorkspace>> =
-            const { std::cell::RefCell::new(HashMap::new()) };
+            std::cell::RefCell::new(HashMap::new());
     }
 
     /// Pointers into the cached MLA decode workspace.
