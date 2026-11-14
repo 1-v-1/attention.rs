@@ -1303,11 +1303,22 @@ pub fn reshape_and_cache(
 ) -> Result<()> {
     if std::env::var("XINFER_DIAG_RAC").is_ok() {
         let n = slot_mapping.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
+        let ptr = |t: &Tensor| -> u64 {
+            use candle::cuda_backend::cudarc::driver::DevicePtr;
+            let (s, _l) = t.storage_and_layout();
+            match &*s {
+                Storage::Cuda(s) => *s.device_ptr() as u64,
+                _ => 0,
+            }
+        };
         eprintln!(
-            "[diag][rac] key={:?} cache={:?} slot={:?}",
+            "[diag][rac] key={:?} cache={:?} slot={:?} key_ptr={:#x} kc_ptr={:#x} slot_ptr={:#x}",
             key.shape(),
             key_cache.shape(),
-            n
+            n,
+            ptr(key),
+            ptr(key_cache),
+            ptr(slot_mapping)
         );
     }
     let op = ReshapeCache {
