@@ -561,7 +561,7 @@ mod cuda {
                     .min(existing.pinned_host.size())
                     .min(1 << 20),
             )
-        };
+        });
         let dev_bytes = dev
             .dtoh_sync_copy(&int_buffer)
             .map_err(|e| candle_core::Error::Msg(format!("dtoh failed: {e:?}")))?;
