@@ -41,6 +41,15 @@ void flashinfer_append_kv_cache(
     cudaStream_t stream
 ) {
 #ifdef USE_FLASHINFER
+    if (getenv("XINFER_DIAG_APPEND") != nullptr) {
+        static int entry_calls = 0;
+        if (entry_calls < 4) {
+            entry_calls++;
+            fprintf(stderr, "[diag][append-entry] nnz=%d batch_size=%d data_type=%d\n",
+                    nnz, batch_size, data_type);
+            fflush(stderr);
+        }
+    }
     if (data_type == 2) {
         #if defined(FLASHINFER_ENABLE_FP8_E4M3)
         if (!k_scale_ptr || !v_scale_ptr) {
