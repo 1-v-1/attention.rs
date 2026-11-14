@@ -552,16 +552,16 @@ mod cuda {
             let ws = ws.borrow();
             let existing = ws
                 .get(&dev.ordinal())
-                .ok_or_else(|| candle_core::Error::msg("no flashinfer workspace"))?;
-            Ok((
+                .expect("no flashinfer workspace");
+            (
                 existing.int_buffer.clone(),
                 existing.pinned_host.as_ptr(),
                 existing
                     .int_size
                     .min(existing.pinned_host.size())
                     .min(1 << 20),
-            ))
-        })?;
+            )
+        };
         let dev_bytes = dev
             .dtoh_sync_copy(&int_buffer)
             .map_err(|e| candle_core::Error::Msg(format!("dtoh failed: {e:?}")))?;
