@@ -44,6 +44,8 @@
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::{sys, CudaSlice, DevicePtr};
 #[cfg(feature = "cuda")]
+use std::collections::HashMap;
+#[cfg(feature = "cuda")]
 use candle_core::cuda_backend::WrapErr;
 use candle_core::Result;
 
@@ -260,6 +262,24 @@ mod cuda {
         pub int_size: usize,
     }
 
+    impl FlashInferWorkspace {
+        /// Splits the workspace into the parts that a replacement needs and
+        /// the page-locked buffer that has to survive the replacement.
+        ///
+        /// `CudaSlice` is reference counted, so cloning it keeps the device
+        /// allocation alive.  The page-locked buffer is not cloneable, so it
+        /// is handed over separately.
+        fn split(&mut self) -> (CudaSlice<u8>, CudaSlice<u8>, usize, PinnedHostBuffer) {
+            let pinned = std::mem::replace(&mut self.pinned_host, PinnedHostBuffer::empty());
+            (
+                self.float_buffer.clone(),
+                self.int_buffer.clone(),
+                self.float_size,
+                pinned,
+            )
+        }
+    }
+
     /// Dedicated CUTLASS workspace, kept separate from FlashInfer buffers.
     #[cfg(feature = "cutlass")]
     pub struct CutlassWorkspace {
@@ -278,32 +298,47 @@ mod cuda {
 
     thread_local! {
         /// Primary FlashInfer workspace (normal operations).
+        ///
+        /// The slot holds **one workspace per device ordinal**.  A single
+        /// thread can serve several devices -- the multi-rank runner drives
+        /// every rank from the same thread and switches the active device
+        /// between steps -- and a CUDA graph captured for one rank bakes in
+        /// the *host* address of the page-locked buffer that the FlashInfer
+        /// plan was materialised into.  Re-creating that buffer whenever the
+        /// active device changes invalidates every captured graph:
+        /// `cuGraphLaunch` then fails with `CUDA_ERROR_INVALID_VALUE` and the
+        /// KV cache is never updated.
         #[cfg(feature = "flashinfer")]
-        pub static WORKSPACE: std::cell::RefCell<Option<FlashInferWorkspace>> = const { std::cell::RefCell::new(None) };
+        pub static WORKSPACE: std::cell::RefCell<HashMap<usize, FlashInferWorkspace>> =
+            const { std::cell::RefCell::new(HashMap::new()) };
 
         /// FlashInfer workspace for CUDA graph captures (separate to avoid interference).
         #[cfg(feature = "flashinfer")]
-        pub static WORKSPACE_GRAPH: std::cell::RefCell<Option<FlashInferWorkspace>> = const { std::cell::RefCell::new(None) };
+        pub static WORKSPACE_GRAPH: std::cell::RefCell<HashMap<usize, FlashInferWorkspace>> =
+            const { std::cell::RefCell::new(HashMap::new()) };
 
         /// Dedicated CUTLASS workspaces, split by execution domain so decode-graph
         /// and MTP/DFlash-verify-graph captures never alias the same device pointer.
         #[cfg(all(feature = "cuda", feature = "cutlass"))]
-        pub static CUTLASS_WORKSPACE_EAGER: std::cell::RefCell<Option<CutlassWorkspace>> =
-            const { std::cell::RefCell::new(None) };
+        pub static CUTLASS_WORKSPACE_EAGER: std::cell::RefCell<HashMap<usize, CutlassWorkspace>> =
+            const { std::cell::RefCell::new(HashMap::new()) };
         #[cfg(all(feature = "cuda", feature = "cutlass"))]
-        pub static CUTLASS_WORKSPACE_DECODE_GRAPH: std::cell::RefCell<Option<CutlassWorkspace>> =
-            const { std::cell::RefCell::new(None) };
+        pub static CUTLASS_WORKSPACE_DECODE_GRAPH: std::cell::RefCell<HashMap<usize, CutlassWorkspace>> =
+            const { std::cell::RefCell::new(HashMap::new()) };
         #[cfg(all(feature = "cuda", feature = "cutlass"))]
-        pub static CUTLASS_WORKSPACE_MTP_GRAPH: std::cell::RefCell<Option<CutlassWorkspace>> =
-            const { std::cell::RefCell::new(None) };
+        pub static CUTLASS_WORKSPACE_MTP_GRAPH: std::cell::RefCell<HashMap<usize, CutlassWorkspace>> =
+            const { std::cell::RefCell::new(HashMap::new()) };
 
         /// Specialized FP8 blockscale workspace.
         #[cfg(feature = "flashinfer")]
-        pub static FLASHINFER_FP8_WORKSPACE_EAGER: std::cell::RefCell<Option<FlashInferFp8Workspace>> = const { std::cell::RefCell::new(None) };
+        pub static FLASHINFER_FP8_WORKSPACE_EAGER: std::cell::RefCell<HashMap<usize, FlashInferFp8Workspace>> =
+            const { std::cell::RefCell::new(HashMap::new()) };
         #[cfg(feature = "flashinfer")]
-        pub static FLASHINFER_FP8_WORKSPACE_DECODE_GRAPH: std::cell::RefCell<Option<FlashInferFp8Workspace>> = const { std::cell::RefCell::new(None) };
+        pub static FLASHINFER_FP8_WORKSPACE_DECODE_GRAPH: std::cell::RefCell<HashMap<usize, FlashInferFp8Workspace>> =
+            const { std::cell::RefCell::new(HashMap::new()) };
         #[cfg(feature = "flashinfer")]
-        pub static FLASHINFER_FP8_WORKSPACE_MTP_GRAPH: std::cell::RefCell<Option<FlashInferFp8Workspace>> = const { std::cell::RefCell::new(None) };
+        pub static FLASHINFER_FP8_WORKSPACE_MTP_GRAPH: std::cell::RefCell<HashMap<usize, FlashInferFp8Workspace>> =
+            const { std::cell::RefCell::new(HashMap::new()) };
     }
 
     /// Initializes or retrieves the FlashInfer workspace for the given device.
@@ -373,26 +408,24 @@ mod cuda {
             // indices.
             let int_size = WORKSPACE_INT_INITIAL_SIZE;
 
-            let needs_init = match ws.as_ref() {
-                None => true,
-                Some(existing) => existing.device_ordinal != ordinal,
-            };
-
-            if needs_init {
+            if !ws.contains_key(&ordinal) {
                 let float_buffer = unsafe { dev.alloc::<u8>(float_size.max(1)) }.w()?;
                 let int_buffer = unsafe { dev.alloc::<u8>(int_size.max(1)) }.w()?;
                 let pinned_host = PinnedHostBuffer::new(int_size)?;
-                *ws = Some(FlashInferWorkspace {
-                    float_buffer,
-                    int_buffer,
-                    pinned_host,
-                    device_ordinal: ordinal,
-                    float_size,
-                    int_size,
-                });
+                ws.insert(
+                    ordinal,
+                    FlashInferWorkspace {
+                        float_buffer,
+                        int_buffer,
+                        pinned_host,
+                        device_ordinal: ordinal,
+                        float_size,
+                        int_size,
+                    },
+                );
             }
 
-            let workspace = ws.as_ref().unwrap();
+            let workspace = ws.get(&ordinal).unwrap();
             Ok((
                 *workspace.float_buffer.device_ptr() as *mut std::ffi::c_void,
                 *workspace.int_buffer.device_ptr() as *mut std::ffi::c_void,
@@ -455,9 +488,10 @@ mod cuda {
         };
         ws_cell.with(|ws| {
             let mut ws = ws.borrow_mut();
-            let current = match ws.as_ref() {
-                Some(existing) if existing.device_ordinal == dev.ordinal() => existing.int_size,
-                _ => 0,
+            let ordinal = dev.ordinal();
+            let current = match ws.get(&ordinal) {
+                Some(existing) => existing.int_size,
+                None => 0,
             };
             if needed <= current {
                 return Ok(());
@@ -470,32 +504,28 @@ mod cuda {
             }
             let int_buffer = unsafe { dev.alloc::<u8>(target) }.w()?;
             let pinned_host = PinnedHostBuffer::new(target)?;
-            let ordinal = dev.ordinal();
-            let old_int_buffer = ws
-                .as_ref()
-                .map(|w| w.int_buffer.clone())
-                .ok_or_else(|| candle_core::Error::msg("workspace has no int buffer"))?;
-            // Take the previous page-locked buffer out of the workspace so
-            // that it is not freed when the workspace is replaced.
-            let old_pinned_host = ws.as_mut().map(|w| std::mem::replace(&mut w.pinned_host, PinnedHostBuffer::empty()));
-            *ws = Some(FlashInferWorkspace {
-                float_buffer: ws
-                    .as_ref()
-                    .map(|w| w.float_buffer.clone())
-                    .ok_or_else(|| candle_core::Error::msg("workspace has no float buffer"))?,
-                int_buffer,
-                pinned_host,
-                device_ordinal: ordinal,
-                float_size: ws.as_ref().map(|w| w.float_size).unwrap_or(0),
-                int_size: target,
-            });
-            // Keep the previous generation alive on purpose: a captured CUDA
-            // graph refers to the host address of the page-locked buffer in
-            // its memcpy node, and to the device address of the int buffer.
-            std::mem::forget(old_int_buffer);
-            if let Some(old) = old_pinned_host {
-                std::mem::forget(old);
-            }
+            let (float_buffer, _old_int_buffer, float_size, old_pinned_host) = {
+                let existing = ws
+                    .get_mut(&ordinal)
+                    .ok_or_else(|| candle_core::Error::msg("workspace has no entry"))?;
+                existing.split()
+            };
+            ws.insert(
+                ordinal,
+                FlashInferWorkspace {
+                    float_buffer,
+                    int_buffer,
+                    pinned_host,
+                    device_ordinal: ordinal,
+                    float_size,
+                    int_size: target,
+                },
+            );
+            // Keep the previous page-locked buffer alive on purpose: a
+            // captured CUDA graph refers to its host address in the memcpy
+            // node it captured, and freeing it would leave the graph
+            // pointing at unmapped memory.
+            std::mem::forget(old_pinned_host);
             Ok(())
         })
     }
@@ -535,10 +565,7 @@ mod cuda {
             };
             ws_cell.with(|ws| {
                 let ws = ws.borrow();
-                match ws.as_ref() {
-                    Some(existing) if existing.device_ordinal == dev.ordinal() => existing.int_size,
-                    _ => 0,
-                }
+                ws.get(&dev.ordinal()).map(|existing| existing.int_size).unwrap_or(0)
             })
         };
         Ok((
@@ -567,16 +594,7 @@ mod cuda {
         };
         ws_cell.with(|ws| {
             let ws = ws.borrow();
-            match ws.as_ref() {
-                Some(existing) => {
-                    if existing.device_ordinal == dev.ordinal() {
-                        existing.float_size
-                    } else {
-                        0
-                    }
-                }
-                None => 0,
-            }
+            ws.get(&dev.ordinal()).map(|existing| existing.float_size).unwrap_or(0)
         })
     }
 
@@ -598,28 +616,31 @@ mod cuda {
 
     #[cfg(all(feature = "cuda", feature = "cutlass"))]
     fn get_or_init_cutlass_workspace_slot(
-        cell: &std::cell::RefCell<Option<CutlassWorkspace>>,
+        cell: &std::cell::RefCell<HashMap<usize, CutlassWorkspace>>,
         dev: &candle_core::cuda_backend::CudaDevice,
         required_size: usize,
     ) -> Result<(*mut std::ffi::c_void, usize)> {
         let mut slot = cell.borrow_mut();
         let ordinal = dev.ordinal();
         let alloc_size = required_size.max(CUTLASS_WORKSPACE_FALLBACK_SIZE).max(1);
-        let needs_init = match slot.as_ref() {
+        let needs_init = match slot.get(&ordinal) {
             None => true,
-            Some(existing) => existing.device_ordinal != ordinal || existing.size < alloc_size,
+            Some(existing) => existing.size < alloc_size,
         };
 
         if needs_init {
             let buffer = unsafe { dev.alloc::<u8>(alloc_size) }.w()?;
-            *slot = Some(CutlassWorkspace {
-                buffer,
-                size: alloc_size,
-                device_ordinal: ordinal,
-            });
+            slot.insert(
+                ordinal,
+                CutlassWorkspace {
+                    buffer,
+                    size: alloc_size,
+                    device_ordinal: ordinal,
+                },
+            );
         }
 
-        let ws = slot.as_ref().unwrap();
+        let ws = slot.get(&ordinal).unwrap();
         Ok((*ws.buffer.device_ptr() as *mut std::ffi::c_void, ws.size))
     }
 
@@ -677,12 +698,12 @@ mod cuda {
 
     #[cfg(feature = "cutlass")]
     thread_local! {
-        static NVFP4_HW_SCRATCH_EAGER: std::cell::RefCell<Option<Nvfp4HwScratchPool>> =
-            const { std::cell::RefCell::new(None) };
-        static NVFP4_HW_SCRATCH_DECODE_GRAPH: std::cell::RefCell<Option<Nvfp4HwScratchPool>> =
-            const { std::cell::RefCell::new(None) };
-        static NVFP4_HW_SCRATCH_MTP_GRAPH: std::cell::RefCell<Option<Nvfp4HwScratchPool>> =
-            const { std::cell::RefCell::new(None) };
+        static NVFP4_HW_SCRATCH_EAGER: std::cell::RefCell<HashMap<usize, Nvfp4HwScratchPool>> =
+            const { std::cell::RefCell::new(HashMap::new()) };
+        static NVFP4_HW_SCRATCH_DECODE_GRAPH: std::cell::RefCell<HashMap<usize, Nvfp4HwScratchPool>> =
+            const { std::cell::RefCell::new(HashMap::new()) };
+        static NVFP4_HW_SCRATCH_MTP_GRAPH: std::cell::RefCell<HashMap<usize, Nvfp4HwScratchPool>> =
+            const { std::cell::RefCell::new(HashMap::new()) };
     }
 
     #[cfg(feature = "cutlass")]
@@ -698,7 +719,7 @@ mod cuda {
 
     #[cfg(feature = "cutlass")]
     fn get_nvfp4_hw_scratch_from_pool(
-        cell: &std::cell::RefCell<Option<Nvfp4HwScratchPool>>,
+        cell: &std::cell::RefCell<HashMap<usize, Nvfp4HwScratchPool>>,
         dev: &candle_core::cuda_backend::CudaDevice,
         act_packed_bytes: usize,
         act_scales_bytes: usize,
@@ -707,11 +728,10 @@ mod cuda {
     ) -> Result<Nvfp4HwScratchPtrs> {
         let mut slot = cell.borrow_mut();
         let ordinal = dev.ordinal();
-        let needs_realloc = match slot.as_ref() {
+        let needs_realloc = match slot.get(&ordinal) {
             None => true,
             Some(p) => {
-                p.device_ordinal != ordinal
-                    || p.act_packed_bytes < act_packed_bytes
+                p.act_packed_bytes < act_packed_bytes
                     || p.act_scales_bytes < act_scales_bytes
                     || p.act_scales_swizzled_bytes < act_scales_swizzled_bytes
                     || p.wscale_swizzled_bytes < wscale_swizzled_bytes
@@ -719,8 +739,7 @@ mod cuda {
         };
 
         if needs_realloc {
-            let old = slot.take();
-            let (ap, as_, asw, ws) = if let Some(ref prev) = old {
+            let (ap, as_, asw, ws) = if let Some(prev) = slot.get(&ordinal) {
                 (
                     act_packed_bytes.max(prev.act_packed_bytes),
                     act_scales_bytes.max(prev.act_scales_bytes),
@@ -735,8 +754,7 @@ mod cuda {
                     wscale_swizzled_bytes,
                 )
             };
-            drop(old);
-            *slot = Some(Nvfp4HwScratchPool {
+            let pool = Nvfp4HwScratchPool {
                 act_packed: unsafe { dev.alloc::<u8>(ap.max(1)) }.w()?,
                 act_packed_bytes: ap,
                 act_scales: unsafe { dev.alloc::<u8>(as_.max(1)) }.w()?,
@@ -749,10 +767,11 @@ mod cuda {
                 sf_scale: unsafe { dev.alloc::<u8>(4) }.w()?,
                 online_scale: unsafe { dev.alloc::<u8>(8) }.w()?,
                 device_ordinal: ordinal,
-            });
+            };
+            slot.insert(ordinal, pool);
         }
 
-        let pool = slot.as_ref().unwrap();
+        let pool = slot.get(&ordinal).unwrap();
         Ok(Nvfp4HwScratchPtrs {
             act_packed: *pool.act_packed.device_ptr() as *mut std::ffi::c_void,
             act_scales: *pool.act_scales.device_ptr() as *mut std::ffi::c_void,
@@ -835,7 +854,8 @@ mod cuda {
 
     #[cfg(feature = "cutlass")]
     thread_local! {
-        pub static MOE_ACTIVATION_POOL: std::cell::RefCell<Option<MoeActivationPool>> = const { std::cell::RefCell::new(None) };
+        pub static MOE_ACTIVATION_POOL: std::cell::RefCell<HashMap<usize, MoeActivationPool>> =
+            const { std::cell::RefCell::new(HashMap::new()) };
     }
 
     #[cfg(feature = "cutlass")]
@@ -861,11 +881,10 @@ mod cuda {
             let mut slot = cell.borrow_mut();
             let ordinal = dev.ordinal();
 
-            let needs_realloc = match slot.as_ref() {
+            let needs_realloc = match slot.get(&ordinal) {
                 None => true,
                 Some(p) => {
-                    p.device_ordinal != ordinal
-                        || p.gathered_bytes < gathered_bytes
+                    p.gathered_bytes < gathered_bytes
                         || p.act_packed_bytes < act_packed_bytes
                         || p.act_scales_bytes < act_scales_bytes
                         || p.rep_out_bytes < rep_out_bytes
@@ -876,8 +895,7 @@ mod cuda {
             if needs_realloc {
                 // Grow-only: CudaSlice Drop uses free_async on the device stream,
                 // and the subsequent alloc is also stream-ordered — no host sync.
-                let old = slot.take();
-                let (g_sz, ap_sz, as_sz, r_sz, m_sz) = if let Some(ref prev) = old {
+                let (g_sz, ap_sz, as_sz, r_sz, m_sz) = if let Some(prev) = slot.get(&ordinal) {
                     (
                         gathered_bytes.max(prev.gathered_bytes),
                         act_packed_bytes.max(prev.act_packed_bytes),
@@ -894,13 +912,12 @@ mod cuda {
                         metadata_bytes,
                     )
                 };
-                drop(old);
                 let gathered = unsafe { dev.alloc::<u8>(g_sz.max(1)) }.w()?;
                 let act_packed = unsafe { dev.alloc::<u8>(ap_sz.max(1)) }.w()?;
                 let act_scales = unsafe { dev.alloc::<u8>(as_sz.max(1)) }.w()?;
                 let rep_out = unsafe { dev.alloc::<u8>(r_sz.max(1)) }.w()?;
                 let metadata = unsafe { dev.alloc::<u8>(m_sz.max(1)) }.w()?;
-                *slot = Some(MoeActivationPool {
+                let pool = MoeActivationPool {
                     gathered,
                     gathered_bytes: g_sz,
                     act_packed,
@@ -912,10 +929,11 @@ mod cuda {
                     metadata,
                     metadata_bytes: m_sz,
                     device_ordinal: ordinal,
-                });
+                };
+                slot.insert(ordinal, pool);
             }
 
-            let pool = slot.as_ref().unwrap();
+            let pool = slot.get(&ordinal).unwrap();
             Ok(MoePoolBuffers {
                 gathered_ptr: *pool.gathered.device_ptr(),
                 act_packed_ptr: *pool.act_packed.device_ptr(),
@@ -935,28 +953,29 @@ mod cuda {
         dev: &candle_core::cuda_backend::CudaDevice,
         required_size: usize,
     ) -> Result<(*mut std::ffi::c_void, usize)> {
-        let init = |cell: &std::cell::RefCell<Option<FlashInferFp8Workspace>>| {
+        let init = |cell: &std::cell::RefCell<HashMap<usize, FlashInferFp8Workspace>>| {
             let mut slot = cell.borrow_mut();
             let ordinal = dev.ordinal();
 
-            let needs_init = match slot.as_ref() {
+            let needs_init = match slot.get(&ordinal) {
                 None => true,
-                Some(existing) => {
-                    existing.device_ordinal != ordinal || existing.size < required_size
-                }
+                Some(existing) => existing.size < required_size,
             };
 
             if needs_init {
                 let alloc_size = required_size.max(1);
                 let buffer = unsafe { dev.alloc::<u8>(alloc_size) }.w()?;
-                *slot = Some(FlashInferFp8Workspace {
-                    buffer,
-                    size: alloc_size,
-                    device_ordinal: ordinal,
-                });
+                slot.insert(
+                    ordinal,
+                    FlashInferFp8Workspace {
+                        buffer,
+                        size: alloc_size,
+                        device_ordinal: ordinal,
+                    },
+                );
             }
 
-            let ws = slot.as_ref().unwrap();
+            let ws = slot.get(&ordinal).unwrap();
             Ok((*ws.buffer.device_ptr() as *mut std::ffi::c_void, ws.size))
         };
 
@@ -992,12 +1011,12 @@ mod cuda {
     }
 
     thread_local! {
-        static MLA_DECODE_WORKSPACE_EAGER: std::cell::RefCell<Option<MlaDecodeWorkspace>> =
-            const { std::cell::RefCell::new(None) };
-        static MLA_DECODE_WORKSPACE_DECODE_GRAPH: std::cell::RefCell<Option<MlaDecodeWorkspace>> =
-            const { std::cell::RefCell::new(None) };
-        static MLA_DECODE_WORKSPACE_MTP_GRAPH: std::cell::RefCell<Option<MlaDecodeWorkspace>> =
-            const { std::cell::RefCell::new(None) };
+        static MLA_DECODE_WORKSPACE_EAGER: std::cell::RefCell<HashMap<usize, MlaDecodeWorkspace>> =
+            const { std::cell::RefCell::new(HashMap::new()) };
+        static MLA_DECODE_WORKSPACE_DECODE_GRAPH: std::cell::RefCell<HashMap<usize, MlaDecodeWorkspace>> =
+            const { std::cell::RefCell::new(HashMap::new()) };
+        static MLA_DECODE_WORKSPACE_MTP_GRAPH: std::cell::RefCell<HashMap<usize, MlaDecodeWorkspace>> =
+            const { std::cell::RefCell::new(HashMap::new()) };
     }
 
     /// Pointers into the cached MLA decode workspace.
@@ -1047,24 +1066,27 @@ mod cuda {
             .saturating_add(meta_bytes)
             .max(1);
 
-        let init = |cell: &std::cell::RefCell<Option<MlaDecodeWorkspace>>| {
+        let init = |cell: &std::cell::RefCell<HashMap<usize, MlaDecodeWorkspace>>| {
             let mut slot = cell.borrow_mut();
             let ordinal = dev.ordinal();
-            let needs_init = match slot.as_ref() {
+            let needs_init = match slot.get(&ordinal) {
                 None => true,
-                Some(existing) => existing.device_ordinal != ordinal || existing.size < required,
+                Some(existing) => existing.size < required,
             };
 
             if needs_init {
                 let buffer = unsafe { dev.alloc::<u8>(required) }.w()?;
-                *slot = Some(MlaDecodeWorkspace {
-                    buffer,
-                    size: required,
-                    device_ordinal: ordinal,
-                });
+                slot.insert(
+                    ordinal,
+                    MlaDecodeWorkspace {
+                        buffer,
+                        size: required,
+                        device_ordinal: ordinal,
+                    },
+                );
             }
 
-            let ws = slot.as_ref().unwrap();
+            let ws = slot.get(&ordinal).unwrap();
             let base = *ws.buffer.device_ptr() as *mut u8;
             Ok(MlaDecodeWorkspacePtrs {
                 tmp_out: base as *mut std::ffi::c_void,
