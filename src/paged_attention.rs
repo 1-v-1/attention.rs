@@ -1307,7 +1307,10 @@ pub fn reshape_and_cache(
             use candle::cuda_backend::cudarc::driver::DevicePtr;
             let (s, _l) = t.storage_and_layout();
             match &*s {
-                Storage::Cuda(s) => s.as_slice().as_ptr() as u64,
+                Storage::Cuda(s) => s
+                    .as_cuda_slice::<u8>()
+                    .map(|sl| *sl.device_ptr() as u64)
+                    .unwrap_or(0),
                 _ => 0,
             }
         };
