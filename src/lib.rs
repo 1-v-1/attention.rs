@@ -809,9 +809,14 @@ impl PagedAttention {
         // TurboQuant: only native flash path supports turbo KV cache.
         // Both cases force use of native flash path below.
 
+        // Debug switch: skip the FlashInfer path and use the native flash
+        // implementation. Used to tell a FlashInfer plan problem apart from a
+        // CUDA-graph problem.
+        let skip_flashinfer = std::env::var("XINFER_SKIP_FLASHINFER").is_ok();
+
         #[cfg(feature = "flash")]
         let force_native_flash =
-            self.head_dim > 256 || input_metadata.flashinfer_metadata.is_none();
+            self.head_dim > 256 || input_metadata.flashinfer_metadata.is_none() || skip_flashinfer;
         #[cfg(not(feature = "flash"))]
         let force_native_flash = false;
 
