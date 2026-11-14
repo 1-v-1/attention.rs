@@ -915,10 +915,10 @@ impl PagedAttention {
                         // slot, but only the native kernel keeps working when
                         // it is captured into a CUDA graph.
                         let slot = input_metadata.slot_mapping.flatten_all()?;
-                        let slot = if slot.dtype() == candle::DType::I64 {
+                        let slot = if slot.dtype() == candle_core::DType::I64 {
                             slot.contiguous()?
                         } else {
-                            slot.to_dtype(candle::DType::I64)?.contiguous()?
+                            slot.to_dtype(candle_core::DType::I64)?.contiguous()?
                         };
                         reshape_and_cache(
                             &key,
