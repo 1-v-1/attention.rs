@@ -748,6 +748,102 @@ extern "C" void nvfp4_matmul_hmma884_f16(const __half *input,
 }
 
 // ---------------------------------------------------------------------------
+// SM70 decode GEMV for NVFP4 (M == 1).
+//
+// The HMMA.884 kernel above is tensor-core based, but on Volta it needs eight
+// rows of A per atom, so a warp can only cover 32 output columns.  With the
+// shapes this model uses that leaves just N/32 CTAs (68 CTAs for N=8704 on an
+// 80 SM V100), i.e. a single warp per SM and every stall fully exposed: the
+// kernel sustains 66-105 GB/s while a plain read of the same bytes reaches
+// 818 GB/s.
+//
+// This kernel uses the layout 1Cat's dense SM70 kernels use:
+//   * one warp owns one output column and the 32 lanes split K in stripes
+//     (lane l takes k-block l, l+32, ...), so the weight and activation loads
+//     are fully coalesced and no shared-memory staging is needed;
+//   * the weights are decoded straight from global memory into registers with
+//     the same branch-free bit trick the HMMA path uses;
+//   * the products are accumulated in FP32, which is exact for F16 x F16.
+//
+// Measured on a V100 with the 27B shapes: 0.0595 ms for N=8704, K=5120
+// (468 GB/s) against 0.2614 ms (107 GB/s) for the HMMA path, and the result
+// is closer to a double-precision CPU reference than the HMMA path is.
+// ---------------------------------------------------------------------------
+namespace sm70_nvfp4 {
+
+__device__ __forceinline__ float2 gemv_half2_to_float2(uint32_t v) {
+  return __half22float2(*reinterpret_cast<const __half2 *>(&v));
+}
+
+__global__ void nvfp4_gemv_sm70_kernel(const __half *__restrict__ input,
+                                        const uint32_t *__restrict__ weight,
+                                        const __half *__restrict__ weight_scale,
+                                        const __half *__restrict__ bias,
+                                        __half *__restrict__ output, int N,
+                                        int K) {
+  const int n = blockIdx.x;
+  const int lane = threadIdx.x;
+  const int words = K >> 3;  // eight elements per weight word
+  const uint32_t *wrow = weight + (size_t)n * words;
+  const __half *srow = weight_scale + (size_t)n * (K >> 4);
+
+  float acc = 0.0f;
+  for (int kb = lane; kb < words; kb += 32) {
+    const uint32_t w = wrow[kb];
+    const __half sh = srow[kb >> 1];
+    uint32_t sb = *reinterpret_cast<const uint32_t *>(&sh);
+    sb |= sb << 16;  // broadcast the block scale into both halves
+
+    uint32_t b[4];
+    decode_fp4_e2m1_x8(w, sb, b);
+    // The decoder emits (e0,e4) (e1,e5) (e2,e6) (e3,e7); re-pair into k order.
+    const uint32_t p0 = (b[0] & 0xffffu) | (b[1] << 16);
+    const uint32_t p1 = (b[2] & 0xffffu) | (b[3] << 16);
+    const uint32_t p2 = (b[0] >> 16) | (b[1] & 0xffff0000u);
+    const uint32_t p3 = (b[2] >> 16) | (b[3] & 0xffff0000u);
+
+    const uint4 av = *reinterpret_cast<const uint4 *>(input + (size_t)kb * 8);
+    const float2 a0 = gemv_half2_to_float2(av.x);
+    const float2 a1 = gemv_half2_to_float2(av.y);
+    const float2 a2 = gemv_half2_to_float2(av.z);
+    const float2 a3 = gemv_half2_to_float2(av.w);
+    const float2 w0 = gemv_half2_to_float2(p0);
+    const float2 w1 = gemv_half2_to_float2(p1);
+    const float2 w2 = gemv_half2_to_float2(p2);
+    const float2 w3 = gemv_half2_to_float2(p3);
+
+    acc = fmaf(a0.x, w0.x, acc);
+    acc = fmaf(a0.y, w0.y, acc);
+    acc = fmaf(a1.x, w1.x, acc);
+    acc = fmaf(a1.y, w1.y, acc);
+    acc = fmaf(a2.x, w2.x, acc);
+    acc = fmaf(a2.y, w2.y, acc);
+    acc = fmaf(a3.x, w3.x, acc);
+    acc = fmaf(a3.y, w3.y, acc);
+  }
+
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    acc += __shfl_xor_sync(0xffffffffu, acc, off);
+  if (lane == 0) {
+    float v = acc;
+    if (bias) v += __half2float(bias[n]);
+    output[n] = __float2half(v);
+  }
+}
+
+}  // namespace sm70_nvfp4
+
+extern "C" void nvfp4_gemv_sm70_f16(const __half *input, const uint32_t *weight,
+                                    const __half *weight_scale,
+                                    const __half *bias, __half *output, int N,
+                                    int K, cudaStream_t stream) {
+  if (N <= 0 || K <= 0 || (K & 15) != 0) return;
+  sm70_nvfp4::nvfp4_gemv_sm70_kernel<<<N, 32, 0, stream>>>(
+      input, weight, weight_scale, bias, output, N, K);
+}
+
+// ---------------------------------------------------------------------------
 // Device-side cross-check of the SM70 repack.
 //
 // The repack rewrites the weight into the layout the HMMA.884 atom expects

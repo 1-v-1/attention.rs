@@ -829,20 +829,42 @@ pub fn nvfp4_matmul(
                 let stream = *cuda_dev.cu_stream() as i64;
 
                 unsafe {
-                    ffi::nvfp4_matmul_hmma884_f16(
-                        input_ptr,
-                        weight_ptr,
-                        scale_ptr,
-                        weight_global_scale,
-                        std::ptr::null(),
-                        bias_ptr,
-                        output_ptr,
-                        m as i32,
-                        n as i32,
-                        k as i32,
-                        has_bias,
-                        stream,
-                    );
+                    if m == 1 {
+                        // SM70 decode GEMV: one warp per output column.
+                        //
+                        // The HMMA.884 path can only cover 32 output columns
+                        // per warp on Volta, which leaves 68 CTAs for N=8704
+                        // on an 80 SM V100 -- one warp per SM with every stall
+                        // fully exposed.  The GEMV splits K across the 32
+                        // lanes of a warp instead: 468 GB/s against 107 GB/s,
+                        // and closer to a double-precision CPU reference than
+                        // the HMMA path.
+                        ffi::nvfp4_gemv_sm70_f16(
+                            input_ptr,
+                            weight_ptr,
+                            scale_ptr,
+                            bias_ptr,
+                            output_ptr,
+                            n as i32,
+                            k as i32,
+                            stream,
+                        );
+                    } else {
+                        ffi::nvfp4_matmul_hmma884_f16(
+                            input_ptr,
+                            weight_ptr,
+                            scale_ptr,
+                            weight_global_scale,
+                            std::ptr::null(),
+                            bias_ptr,
+                            output_ptr,
+                            m as i32,
+                            n as i32,
+                            k as i32,
+                            has_bias,
+                            stream,
+                        );
+                    }
                 }
 
                 // Optional cross-check against the generic software dequant

@@ -1126,6 +1126,17 @@ extern "C" {
         stream: i64,
     );
 
+    /// SM70 (Volta) decode GEMV for channel-wise FP8 (M == 1).
+    pub fn fp8_gemv_sm70_f16(
+        input: *const c_void,     // [K]
+        weight: *const u8,        // [N, K]
+        weight_scale: *const f32, // [N], one scale per output row
+        output: *mut c_void,      // [N]
+        n: c_int,
+        k: c_int,
+        stream: i64,
+    );
+
     pub fn fp8_matmul_f16_cutlass(
         input_q: *const u8,
         input_scale: *const f32,
@@ -3145,6 +3156,18 @@ extern "C" {
         n: c_int,
         k: c_int,
         has_bias: bool,
+        stream: i64,
+    );
+
+    /// SM70 (Volta) decode GEMV for NVFP4 (M == 1).
+    pub fn nvfp4_gemv_sm70_f16(
+        input: *const c_void,
+        weight: *const u32,
+        weight_scale: *const u16,
+        bias: *const c_void,
+        output: *mut c_void,
+        n: c_int,
+        k: c_int,
         stream: i64,
     );
 

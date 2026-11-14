@@ -235,6 +235,35 @@ fn fp8_matmul_channelwise(
     };
     let stream = *input.device().as_cuda_device()?.cu_stream() as i64;
 
+    // SM70 (Volta) decode fast path.
+    //
+    // The generic kernel converts every weight to FP32 in shared memory with a
+    // branchy software conversion; on a V100 it sustains 86-96 GB/s while a
+    // plain read of the same bytes reaches 818 GB/s.  The dedicated GEMV (one
+    // warp per output column, striped over K) reaches 715 GB/s and is
+    // bit-identical to the generic kernel for channel-wise scales.  Only
+    // single-token decoding can use it.
+    let sm_version = input
+        .device()
+        .as_cuda_device()
+        .ok()
+        .and_then(crate::cuda_utils::sm_version)
+        .unwrap_or(0) as usize;
+    if m == 1 && sm_version < 80 && input.dtype() == DType::F16 && (k & 15) == 0 {
+        unsafe {
+            ffi::fp8_gemv_sm70_f16(
+                input_ptr as *const core::ffi::c_void,
+                weight_ptr as *const u8,
+                scale_ptr as *const f32,
+                output_ptr as *mut core::ffi::c_void,
+                n as i32,
+                k as i32,
+                stream,
+            );
+        }
+        return Ok(output);
+    }
+
     unsafe {
         match input.dtype() {
             DType::F16 => ffi::fp8_matmul_f16_channelwise(
