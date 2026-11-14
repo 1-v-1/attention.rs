@@ -344,6 +344,20 @@ void flashinfer_decode_plan_wrapper(
                             static_cast<const char*>(page_locked_int_buffer) +
                             plan_info.kv_chunk_size_ptr_offset);
                     }
+                    // Dump the first few entries of the plan vectors: they
+                    // decide which pages the decode kernel reads.
+                    const int* req_h = reinterpret_cast<const int*>(
+                        static_cast<const char*>(page_locked_int_buffer) +
+                        plan_info.request_indices_offset);
+                    const int* kvt_h = reinterpret_cast<const int*>(
+                        static_cast<const char*>(page_locked_int_buffer) +
+                        plan_info.kv_tile_indices_offset);
+                    const int* oi_h = reinterpret_cast<const int*>(
+                        static_cast<const char*>(page_locked_int_buffer) +
+                        plan_info.o_indptr_offset);
+                    const bool* bvm_h = reinterpret_cast<const bool*>(
+                        static_cast<const char*>(page_locked_int_buffer) +
+                        plan_info.block_valid_mask_offset);
                     fprintf(stderr,
                             "[flashinfer][decode_plan] pbs=%u split_kv=%d graph=%d bs=%d "
                             "qo=%u kv=%u hd=%u page=%d indptr0=%d indptrN=%d "
@@ -360,6 +374,18 @@ void flashinfer_decode_plan_wrapper(
                             (long long)plan_info.o_indptr_offset,
                             (long long)plan_info.kv_chunk_size_ptr_offset,
                             (unsigned)kv_chunk);
+                    fprintf(stderr, "[flashinfer][decode_plan] req[0..3]=");
+                    for (int i = 0; i < 4 && i < (int)plan_info.padded_batch_size; ++i)
+                        fprintf(stderr, "%d,", req_h[i]);
+                    fprintf(stderr, " kvt[0..3]=");
+                    for (int i = 0; i < 4 && i < (int)plan_info.padded_batch_size; ++i)
+                        fprintf(stderr, "%d,", kvt_h[i]);
+                    fprintf(stderr, " oi[0..3]=");
+                    for (int i = 0; i < 4; ++i) fprintf(stderr, "%d,", oi_h[i]);
+                    fprintf(stderr, " bvm[0..3]=");
+                    for (int i = 0; i < 4 && i < (int)plan_info.padded_batch_size; ++i)
+                        fprintf(stderr, "%d,", (int)bvm_h[i]);
+                    fprintf(stderr, "\n");
                     fflush(stderr);
                 }
             });
