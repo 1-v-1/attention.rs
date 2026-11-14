@@ -1302,7 +1302,10 @@ pub fn reshape_and_cache(
     slot_mapping: &Tensor,
 ) -> Result<()> {
     if std::env::var("XINFER_DIAG_RAC").is_ok() {
-        let n = slot_mapping.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
+        // NOTE: no device->host copy here.  A D2H copy during a CUDA graph
+        // capture invalidates the capture, and this function runs inside the
+        // capture.  The slot value is printed from inside the kernel instead.
+        let n: Vec<f32> = Vec::new();
         let ptr = |t: &Tensor| -> u64 {
             use candle::cuda_backend::cudarc::driver::DevicePtr;
             let (s, l) = t.storage_and_layout();
