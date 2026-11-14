@@ -920,6 +920,30 @@ impl PagedAttention {
                         } else {
                             slot.to_dtype(candle_core::DType::I64)?.contiguous()?
                         };
+                        if std::env::var("XINFER_DIAG_RAC").is_ok() {
+                            // Print the pointers the kernel actually gets.
+                            // The CUDA graph bakes them into the launch, so a
+                            // mismatch with the cache the engine reads back
+                            // means the graph writes into a different buffer.
+                            use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+                            let ptr = |t: &Tensor| -> u64 {
+                                let (st, _l) = t.storage_and_layout();
+                                match &*st {
+                                    candle_core::Storage::Cuda(s) => s
+                                        .as_cuda_slice::<u8>()
+                                        .map(|sl| *sl.device_ptr() as u64)
+                                        .unwrap_or(0),
+                                    _ => 0,
+                                }
+                            };
+                            eprintln!(
+                                "[diag][rac] kc={:#x} vc={:#x} slot_ptr={:#x} key={:#x}",
+                                ptr(kc),
+                                ptr(vc),
+                                ptr(&slot),
+                                ptr(&key)
+                            );
+                        }
                         reshape_and_cache(
                             &key,
                             &value,
