@@ -530,6 +530,77 @@ mod cuda {
         })
     }
 
+    /// Diagnostic: compare the device plan buffer with the page-locked host
+    /// buffer that the plan is materialized from.
+    ///
+    /// The captured CUDA graph copies the plan into the device buffer with a
+    /// memcpy node that was recorded at capture time.  If that node does not
+    /// run -- or if it copies into a buffer that the driver has since
+    /// reallocated -- the decode kernel reads the *capture-time* plan and
+    /// therefore the wrong number of KV tiles.
+    #[cfg(feature = "flashinfer")]
+    pub fn diag_plan_device_matches(
+        dev: &candle_core::cuda_backend::CudaDevice,
+        for_cuda_graph: bool,
+    ) -> Result<(bool, String)> {
+        let ws_cell = if for_cuda_graph {
+            &WORKSPACE_GRAPH
+        } else {
+            &WORKSPACE
+        };
+        let (int_buffer, pinned_ptr, n) = ws_cell.with(|ws| {
+            let ws = ws.borrow();
+            let existing = ws
+                .get(&dev.ordinal())
+                .ok_or_else(|| candle_core::Error::msg("no flashinfer workspace"))?;
+            Ok((
+                existing.int_buffer.clone(),
+                existing.pinned_host.as_ptr(),
+                existing
+                    .int_size
+                    .min(existing.pinned_host.size())
+                    .min(1 << 20),
+            ))
+        })?;
+        let dev_bytes = dev
+            .dtoh_sync_copy(&int_buffer)
+            .map_err(|e| candle_core::Error::Msg(format!("dtoh failed: {e:?}")))?;
+        let host_bytes = unsafe { std::slice::from_raw_parts(pinned_ptr as *const u8, n) };
+        let n = std::cmp::min(n, dev_bytes.len());
+        let mut first_diff = None;
+        for i in 0..n {
+            if dev_bytes[i] != host_bytes[i] {
+                first_diff = Some(i);
+                break;
+            }
+        }
+        let dump = |bytes: &[u8], off: usize| -> String {
+            let mut s = String::new();
+            for i in 0..8 {
+                let b = off + 4 * i;
+                if b + 4 > bytes.len() {
+                    break;
+                }
+                let v = i32::from_le_bytes([
+                    bytes[b],
+                    bytes[b + 1],
+                    bytes[b + 2],
+                    bytes[b + 3],
+                ]);
+                s.push_str(&format!("{} ", v));
+            }
+            s
+        };
+        let report = format!(
+            "match={} first_diff={:?} dev_o_indptr[0..8]={} host_o_indptr[0..8]={}",
+            first_diff.is_none(),
+            first_diff,
+            dump(&dev_bytes, 1600),
+            dump(host_bytes, 1600)
+        );
+        Ok((first_diff.is_none(), report))
+    }
+
     /// Returns (float_ptr, float_size, int_ptr, int_size, page_locked_ptr, page_locked_size).
     #[cfg(feature = "flashinfer")]
     pub fn get_plan_workspace(
