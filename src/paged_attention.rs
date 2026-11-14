@@ -1301,6 +1301,15 @@ pub fn reshape_and_cache(
     v_scales: Option<&Tensor>,
     slot_mapping: &Tensor,
 ) -> Result<()> {
+    if std::env::var("XINFER_DIAG_RAC").is_ok() {
+        let n = slot_mapping.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
+        eprintln!(
+            "[diag][rac] key={:?} cache={:?} slot={:?}",
+            key.shape(),
+            key_cache.shape(),
+            n
+        );
+    }
     let op = ReshapeCache {
         value: value.to_owned(),
         key_cache: key_cache.to_owned(),
