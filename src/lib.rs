@@ -1043,13 +1043,18 @@ impl PagedAttention {
                 }
 
                 if !flashinfer_group_supported {
-                    tracing::warn!(
-                    group_size = group_size,
-                    head_size = head_size,
-                    is_prefill = input_metadata.is_prefill,
-                    prefill_sm_supported = flashinfer_prefill_sm_supported,
-                    "flashinfer disabled for this layer: unsupported gqa/head_dim combination, falling back"
-                );
+                    // Expected on SM70 (and for group sizes flashinfer does
+                    // not implement): log once per process, at debug level.
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::debug!(
+                        group_size = group_size,
+                        head_size = head_size,
+                        is_prefill = input_metadata.is_prefill,
+                        prefill_sm_supported = flashinfer_prefill_sm_supported,
+                        "flashinfer disabled for this layer: unsupported gqa/head_dim combination, falling back"
+                    );
+                    });
                 }
             }
         } // end if !force_native_flash (flashinfer)
