@@ -270,7 +270,9 @@ fn fp8_matmul_channelwise(
     // ~103 TF/s (bench_dense_gemm.cu), ~8x faster. The F16 weight store is
     // lossless for the FP8 value (4 significant bits) and keeps 10 bits of the
     // per-channel F32 scale, so rounding stays far below FP8's own step.
-    if sm_version < 80 && input.dtype() == DType::F16 && (k & 7) == 0 {
+    if sm_version < 80 && input.dtype() == DType::F16 && (k & 7) == 0
+        && m >= 256
+    {
         let w_f16 = unsafe { Tensor::empty_((n, k), DType::F16, input.device())? };
         let w_out = get_cuda_slice::<half::f16>(&w_f16)?;
         unsafe {
