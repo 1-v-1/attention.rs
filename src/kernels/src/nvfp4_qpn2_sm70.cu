@@ -157,24 +157,30 @@ struct Nvfp4Qpn2CodeReader {
 
 // 1Cat: nvfp4_qpn2_accumulate_sm70<16, 2, RowTiles, false, false, false, 4,
 // true>, with the per-column global scale (see file header).
-template <int RowTiles>
+// 1Cat: nvfp4_qpn2_accumulate_sm70 (fully parameterized). With TileColumns=16
+// each physical warp owns two logical K partitions (one per 16-column half
+// of the 32-row weight tile), preserving each partition's MMA chain and
+// ascending reduction order; adjacent output tiles reuse the same weight tile.
+template <int SplitK, int NAcc, int RowTiles = 1, int TileColumns = 32>
 __device__ __forceinline__ void nvfp4_qpn2_accumulate_sm70(
     const uint8_t *__restrict__ codes, const uint8_t *__restrict__ scales,
     const half *__restrict__ input, half *__restrict__ output, int n, int k,
     int m, float global_scale, const float *__restrict__ column_gs,
     const half *__restrict__ bias) {
-  constexpr int SplitK = 16;
-  constexpr int TileColumns = 32;
   constexpr int QuadsPerTile = TileColumns / 8;
   __shared__ float partials[SplitK][RowTiles * 8 * TileColumns];
 
   const int lane = threadIdx.x & 31;
   const int quadpair = (lane >> 2) & 3;
-  const int warp = threadIdx.x >> 5;
+  const int warp =
+      (threadIdx.x >> 5) * (32 / TileColumns) + quadpair / QuadsPerTile;
   const int output_tile = blockIdx.x;
-  const int tile = output_tile;
+  const int tile = output_tile * TileColumns / 32;
   const int mapped_lane =
-      (lane & 19) | ((quadpair % QuadsPerTile) << 2);
+      (lane & 19) |
+      ((quadpair % QuadsPerTile +
+        (output_tile % (32 / TileColumns)) * QuadsPerTile)
+       << 2);
   const int local_row = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int row_base = blockIdx.y * kQpn2RowsPerCta * RowTiles;
   const int groups_k16 = k >> 4;
@@ -190,11 +196,11 @@ __device__ __forceinline__ void nvfp4_qpn2_accumulate_sm70(
                        : column_gs[static_cast<size_t>(tile) * 32 +
                                   qpn2_col_from_lane(mapped_lane)];
 
-  float accum[RowTiles][2][8];
+  float accum[RowTiles][NAcc][8];
 #pragma unroll
   for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
 #pragma unroll
-    for (int chain = 0; chain < 2; ++chain) {
+    for (int chain = 0; chain < NAcc; ++chain) {
 #pragma unroll
       for (int index = 0; index < 8; ++index) {
         accum[row_tile][chain][index] = 0.0f;
@@ -226,17 +232,20 @@ __device__ __forceinline__ void nvfp4_qpn2_accumulate_sm70(
       const unsigned *a0 = reinterpret_cast<const unsigned *>(&input01);
       const unsigned *a1 = reinterpret_cast<const unsigned *>(&input23);
       VLLM_SM70_QPN2_MMA(accum[row_tile][0], a0[0], a0[1], b[0], b[1]);
-      VLLM_SM70_QPN2_MMA(accum[row_tile][1], a0[2], a0[3], b[2], b[3]);
-      VLLM_SM70_QPN2_MMA(accum[row_tile][0], a1[0], a1[1], b[4], b[5]);
-      VLLM_SM70_QPN2_MMA(accum[row_tile][1], a1[2], a1[3], b[6], b[7]);
+      VLLM_SM70_QPN2_MMA(accum[row_tile][1 % NAcc], a0[2], a0[3], b[2], b[3]);
+      VLLM_SM70_QPN2_MMA(accum[row_tile][2 % NAcc], a1[0], a1[1], b[4], b[5]);
+      VLLM_SM70_QPN2_MMA(accum[row_tile][3 % NAcc], a1[2], a1[3], b[6], b[7]);
     }
   }
 
 #pragma unroll
   for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
 #pragma unroll
-    for (int index = 0; index < 8; ++index) {
-      accum[row_tile][0][index] += accum[row_tile][1][index];
+    for (int chain = 1; chain < NAcc; ++chain) {
+#pragma unroll
+      for (int index = 0; index < 8; ++index) {
+        accum[row_tile][0][index] += accum[row_tile][chain][index];
+      }
     }
   }
 
@@ -273,15 +282,17 @@ __device__ __forceinline__ void nvfp4_qpn2_accumulate_sm70(
   }
 }
 
-// 1Cat: nvfp4_qpn2_native_projection_sm70_kernel (m <= 8) and its RowTiles=2
-// sibling (8 < m <= 16).
-template <int K, int RowTiles>
-__global__ __launch_bounds__(512, 2) void nvfp4_qpn2_projection_sm70_kernel(
+// 1Cat: nvfp4_qpn2_projection_sm70_kernel — the native m <= 8 path and its
+// RowTiles=2 sibling (8 < m <= 16). Thread count and residency follow the
+// tile width: 64/TileColumns CTAs per SM stay resident either way.
+template <int K, int TileColumns, int SplitK, int RowTiles = 1>
+__global__ __launch_bounds__(TileColumns * SplitK, 64 / TileColumns)
+    void nvfp4_qpn2_projection_sm70_kernel(
     const uint8_t *__restrict__ codes, const uint8_t *__restrict__ scales,
     const half *__restrict__ input, half *__restrict__ output, int n, int k,
     int m, float global_scale, const float *__restrict__ column_gs,
     const half *__restrict__ bias) {
-  nvfp4_qpn2_accumulate_sm70<RowTiles>(
+  nvfp4_qpn2_accumulate_sm70<SplitK, 2, RowTiles, TileColumns>(
       codes, scales, input, output, n, K > 0 ? K : k, m, global_scale,
       column_gs, bias);
 }
@@ -435,18 +446,18 @@ extern "C" void nvfp4_qpn2_matmul_sm70(
   if (m <= 0 || n <= 0 || k <= 0) return;
   if (m <= 8) {
     if (k == 5120) {
-      qpn2_sm70::nvfp4_qpn2_projection_sm70_kernel<5120, 1>
+      qpn2_sm70::nvfp4_qpn2_projection_sm70_kernel<5120, 32, 16>
           <<<dim3(n / 32, (m + 7) / 8), 512, 0, s>>>(
               codes, scales, input, output, n, k, m, global_scale,
               column_global_scale, bias);
     } else {
-      qpn2_sm70::nvfp4_qpn2_projection_sm70_kernel<0, 1>
+      qpn2_sm70::nvfp4_qpn2_projection_sm70_kernel<0, 32, 16>
           <<<dim3(n / 32, (m + 7) / 8), 512, 0, s>>>(
               codes, scales, input, output, n, k, m, global_scale,
               column_global_scale, bias);
     }
   } else if (m <= 16) {
-    qpn2_sm70::nvfp4_qpn2_projection_sm70_kernel<0, 2>
+    qpn2_sm70::nvfp4_qpn2_projection_sm70_kernel<0, 32, 16, 2>
         <<<dim3(n / 32, (m + 15) / 16), 512, 0, s>>>(
             codes, scales, input, output, n, k, m, global_scale,
             column_global_scale, bias);
