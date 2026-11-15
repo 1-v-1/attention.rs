@@ -1126,6 +1126,44 @@ extern "C" {
         stream: i64,
     );
 
+    /// SM70 GDN target-verification recurrent update (1Cat gdn_verify_sm70):
+    /// packed [T, q|k|v] rows + cu_seqlens + state slots, state updated in
+    /// place, only accepted tokens commit. `rbuf` null = non-replay.
+    #[allow(non_upper_case_globals)]
+    pub fn gdn_verify_sm70(
+        qkv: *const c_void,
+        a: *const c_void,
+        b: *const c_void,
+        a_log: *const c_void,
+        dt_bias: *const c_void,
+        state: *mut c_void,
+        o: *mut c_void,
+        cu: *const c_int,
+        idx: *const c_int,
+        nacc: *const c_int,
+        n: c_int,
+        h: c_int,
+        hv: c_int,
+        scale: f32,
+        cfg: c_int,
+        s_state: i64,
+        s_idx: c_int,
+        qkv_stride: c_int,
+        lda: c_int,
+        ldb: c_int,
+        rbuf: *const c_void,
+        rn: *const c_int,
+        ctr: *mut u32,
+        nmax: i64,
+        rmap: *const c_int,
+        ckt: *const c_int,
+        cks: *const c_int,
+        tmax: c_int,
+        a_log_is_f32: c_int,
+        dt_bias_is_f32: c_int,
+        stream: i64,
+    );
+
     /// SM70 prefill dequant (1Cat QPN8): channel-wise FP8 -> dense F16.
     pub fn fp8_dequant_channelwise_f16(
         w: *const u8,           // [N, K] packed FP8 bytes
