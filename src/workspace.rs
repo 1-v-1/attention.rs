@@ -88,12 +88,14 @@ pub const WORKSPACE_INT_SIZE: usize = 128 * 1024 * 1024;
 /// batch a 16 GB card can hold; the buffer grows on demand afterwards.
 pub const WORKSPACE_INT_INITIAL_SIZE: usize = 4 * 1024 * 1024;
 
-/// Size of the reduced float buffer used by the eager workspace on Volta.
+/// Size of the float buffer used by the eager workspace on Volta.
 ///
-/// The FlashInfer prefill kernels do not run on Volta, so the 256 MiB float
-/// buffer would be wasted.  The decode plan still needs some float scratch
-/// for the split-KV path, so the buffer is not dropped entirely.
-pub const SM70_EAGER_FLOAT_SIZE: usize = 8 * 1024 * 1024;
+/// Even though the FlashInfer prefill kernels do not run on Volta, the
+/// prefill *plan* does — and its plan structs and split-KV scratch scale
+/// with the request length (an 8k-token request needs ~58 MiB for
+/// batch_prefill_tmp_v alone).  An 8 MiB buffer overflowed the plan
+/// allocator and aborted the runner with a C++ exception.
+pub const SM70_EAGER_FLOAT_SIZE: usize = FLASHINFER_PLAN_FLOAT_SIZE;
 
 /// Fallback workspace size when flashinfer is disabled.
 #[cfg(feature = "cuda")]
