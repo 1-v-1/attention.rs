@@ -1895,3 +1895,316 @@ fn mlx_dequant_embedding_metal(
     }
     Ok(output)
 }
+
+// ---------------------------------------------------------------------------
+// SM70 QPN2 path (1Cat-vLLM port).
+//
+// The QPN2 layout is a permutation of the packed checkpoint bytes: codes
+// [N, K/2] u8 in [N/32][K/16][lane][uint2] order, block scales [N, K/16] u8
+// in [N/32][K/16][lane] order.  Same dtype, same shape, same byte count as
+// the checkpoint form, so the loader repacks once and drops the original.
+// ---------------------------------------------------------------------------
+
+/// Repack packed NVFP4 weights into the SM70 QPN2 layout.
+///
+/// `weight` is `[N, K/2]` packed u8 and `scale` is `[N, K/16]` E4M3 bytes;
+/// the returned tensors keep those shapes and carry the QPN2 permutation.
+#[cfg(feature = "cuda")]
+pub fn nvfp4_qpn2_prepack(weight: &Tensor, scale: &Tensor) -> Result<(Tensor, Tensor)> {
+    use candle_core::Storage;
+    let dev = weight.device();
+    let cuda_dev = dev.as_cuda_device()?;
+    let stream = *cuda_dev.cu_stream() as i64;
+    let n = weight.dims()[0];
+    let k = weight.dims()[1] * 2;
+    if k % 16 != 0 || n % 32 != 0 {
+        candle_core::bail!(
+            "nvfp4_qpn2_prepack: need N % 32 == 0 and K % 16 == 0, got N={n} K={k}"
+        );
+    }
+    let codes_out = Tensor::zeros((n, k / 2), DType::U8, dev)?;
+    let scales_out = Tensor::zeros((n, k / 16), DType::U8, dev)?;
+
+    let (weight_ptr, scale_ptr, codes_ptr, scales_ptr) = {
+        let (ws, _) = weight.storage_and_layout();
+        let (ss, _) = scale.storage_and_layout();
+        let (co, _) = codes_out.storage_and_layout();
+        let (so, _) = scales_out.storage_and_layout();
+        let wp = match &*ws {
+            Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr() as *const u8,
+            _ => candle_core::bail!("weight must be on CUDA"),
+        };
+        let sp = match &*ss {
+            Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr() as *const u8,
+            _ => candle_core::bail!("scale must be on CUDA"),
+        };
+        let cp = match &*co {
+            Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr() as *mut u8,
+            _ => candle_core::bail!("codes_out must be on CUDA"),
+        };
+        let sop = match &*so {
+            Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr() as *mut u8,
+            _ => candle_core::bail!("scales_out must be on CUDA"),
+        };
+        (wp, sp, cp, sop)
+    };
+
+    unsafe {
+        ffi::nvfp4_qpn2_prepack_sm70(
+            weight_ptr,
+            scale_ptr,
+            codes_ptr,
+            scales_ptr,
+            n as i32,
+            k as i32,
+            stream,
+        );
+    }
+    Ok((codes_out, scales_out))
+}
+
+/// Pack `[M, K]` f16 activations into the K16 layout `[K/16, M, 16]` the m32
+/// QPN2 kernel reads (1Cat: pack_k16_input).
+#[cfg(feature = "cuda")]
+pub fn nvfp4_qpn2_pack_k16(input: &Tensor) -> Result<Tensor> {
+    use candle_core::Storage;
+    let cuda_dev = input.device().as_cuda_device()?;
+    let stream = *cuda_dev.cu_stream() as i64;
+    let m = input.dims()[0];
+    let k = input.dims()[input.dims().len() - 1];
+    let packed = Tensor::zeros(input.dims(), DType::F16, input.device())?;
+    let (input_ptr, packed_ptr) = {
+        let (is, _) = input.storage_and_layout();
+        let (ps, _) = packed.storage_and_layout();
+        let ip = match &*is {
+            Storage::Cuda(c) => *c.as_cuda_slice::<half::f16>()?.device_ptr() as *const u16,
+            _ => candle_core::bail!("input must be on CUDA"),
+        };
+        let pp = match &*ps {
+            Storage::Cuda(c) => *c.as_cuda_slice::<half::f16>()?.device_ptr() as *mut u16,
+            _ => candle_core::bail!("packed must be on CUDA"),
+        };
+        (ip, pp)
+    };
+    unsafe {
+        ffi::nvfp4_qpn2_pack_k16_sm70(input_ptr, packed_ptr, m as i32, k as i32, stream);
+    }
+    Ok(packed)
+}
+
+/// The SM70 QPN2 GEMM (1Cat dispatch: m <= 8 native, 9..16 two-tile,
+/// m > 16 K16-packed two-phase).
+///
+/// `codes` / `code_scales` come from [`nvfp4_qpn2_prepack`].  The global
+/// scale is applied inside the kernel: uniformly when `weight_row_scales`
+/// is `None`, per output column when it is `Some`.
+#[cfg(feature = "cuda")]
+pub fn nvfp4_qpn2_matmul(
+    input: &Tensor,
+    codes: &Tensor,
+    code_scales: &Tensor,
+    weight_global_scale: f32,
+    weight_row_scales: Option<&Tensor>,
+    bias: Option<&Tensor>,
+) -> Result<Tensor> {
+    use candle_core::Storage;
+    let input = if input.is_contiguous() {
+        input.clone()
+    } else {
+        input.contiguous()?
+    };
+    let dims = input.dims();
+    if dims.len() != 2 {
+        candle_core::bail!("nvfp4_qpn2_matmul: expected input rank 2, got {:?}", dims);
+    }
+    let m = dims[0];
+    let k = dims[1];
+    let n = codes.dims()[0];
+    // PROGRESS_PORT 192: at the measured crossover (M >= 256 on every
+    // production shape) 1Cat's dense-prefill route is 1.4-2.2x faster and
+    // bit-identical. Skip it when the dense [K, N] scratch would be huge
+    // (lm_head: 2.5 GB) — that route needs a follow-up chunking design.
+    if m >= 256 && k * n <= 268_435_456 {
+        return nvfp4_qpn4_prefill_matmul(
+            &input,
+            codes,
+            code_scales,
+            weight_global_scale,
+            weight_row_scales,
+            bias,
+        );
+    }
+    let dev = input.device();
+    let cuda_dev = dev.as_cuda_device()?;
+    let stream = *cuda_dev.cu_stream() as i64;
+    let output = Tensor::zeros((m, n), DType::F16, dev)?;
+
+    // 1Cat's m > 16 route reads the K16-packed activation.
+    let packed = if m > 16 {
+        Some(nvfp4_qpn2_pack_k16(&input)?)
+    } else {
+        None
+    };
+    let act = packed.as_ref().unwrap_or(&input);
+
+    let (input_ptr, codes_ptr, scales_ptr, out_ptr) = {
+        let (is, _) = act.storage_and_layout();
+        let (cs, _) = codes.storage_and_layout();
+        let (css, _) = code_scales.storage_and_layout();
+        let (os, _) = output.storage_and_layout();
+        let ip = match &*is {
+            Storage::Cuda(c) => *c.as_cuda_slice::<half::f16>()?.device_ptr() as *const u16,
+            _ => candle_core::bail!("input must be on CUDA"),
+        };
+        let cp = match &*cs {
+            Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr() as *const u8,
+            _ => candle_core::bail!("codes must be on CUDA"),
+        };
+        let csp = match &*css {
+            Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr() as *const u8,
+            _ => candle_core::bail!("code_scales must be on CUDA"),
+        };
+        let op = match &*os {
+            Storage::Cuda(c) => *c.as_cuda_slice::<half::f16>()?.device_ptr() as *mut u16,
+            _ => candle_core::bail!("output must be on CUDA"),
+        };
+        (ip, cp, csp, op)
+    };
+    let column_ptr = match weight_row_scales {
+        Some(rs) => {
+            let (rs_s, _) = rs.storage_and_layout();
+            match &*rs_s {
+                Storage::Cuda(c) => *c.as_cuda_slice::<f32>()?.device_ptr() as *const f32,
+                _ => candle_core::bail!("weight_row_scales must be on CUDA"),
+            }
+        }
+        None => std::ptr::null(),
+    };
+    let bias_ptr = match bias {
+        Some(b) => {
+            let (bs, _) = b.storage_and_layout();
+            match &*bs {
+                Storage::Cuda(c) => *c.as_cuda_slice::<half::f16>()?.device_ptr() as *const u16,
+                _ => candle_core::bail!("bias must be on CUDA"),
+            }
+        }
+        None => std::ptr::null(),
+    };
+
+    unsafe {
+        ffi::nvfp4_qpn2_matmul_sm70(
+            input_ptr,
+            codes_ptr,
+            scales_ptr,
+            weight_global_scale,
+            column_ptr,
+            bias_ptr,
+            out_ptr,
+            m as i32,
+            n as i32,
+            k as i32,
+            stream,
+        );
+    }
+    Ok(output)
+}
+
+/// QPN4 prefill route for M >= 256 (the measured crossover, PROGRESS_PORT 192):
+/// dequantize the same QPN2 tile-major codes to a dense `[K, N]` f16 weight and
+/// run the FP32-accum dense GEMM. Same values as [`nvfp4_qpn2_matmul`] at our
+/// output granularity (bench_gemm_prefill: max_abs=0 at every production shape).
+pub fn nvfp4_qpn4_prefill_matmul(
+    input: &Tensor,
+    codes: &Tensor,
+    code_scales: &Tensor,
+    weight_global_scale: f32,
+    weight_row_scales: Option<&Tensor>,
+    bias: Option<&Tensor>,
+) -> Result<Tensor> {
+    use candle_core::Storage;
+    let input = if input.is_contiguous() {
+        input.clone()
+    } else {
+        input.contiguous()?
+    };
+    let dims = input.dims();
+    if dims.len() != 2 {
+        candle_core::bail!(
+            "nvfp4_qpn4_prefill_matmul: expected input rank 2, got {:?}",
+            dims
+        );
+    }
+    let m = dims[0];
+    let k = dims[1];
+    let n = codes.dims()[0];
+    let dev = input.device();
+    let cuda_dev = dev.as_cuda_device()?;
+    let stream = *cuda_dev.cu_stream() as i64;
+    let output = Tensor::zeros((m, n), DType::F16, dev)?;
+    let dense = Tensor::zeros((k, n), DType::F16, dev)?;
+
+    let (input_ptr, codes_ptr, scales_ptr, dense_ptr, out_ptr) = {
+        let (is, _) = input.storage_and_layout();
+        let (cs, _) = codes.storage_and_layout();
+        let (css, _) = code_scales.storage_and_layout();
+        let (ds, _) = dense.storage_and_layout();
+        let (os, _) = output.storage_and_layout();
+        let ip = match &*is {
+            Storage::Cuda(c) => *c.as_cuda_slice::<half::f16>()?.device_ptr() as *const u16,
+            _ => candle_core::bail!("input must be on CUDA"),
+        };
+        let cp = match &*cs {
+            Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr() as *const u8,
+            _ => candle_core::bail!("codes must be on CUDA"),
+        };
+        let csp = match &*css {
+            Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr() as *const u8,
+            _ => candle_core::bail!("code_scales must be on CUDA"),
+        };
+        let dp = match &*ds {
+            Storage::Cuda(c) => *c.as_cuda_slice::<half::f16>()?.device_ptr() as *mut u16,
+            _ => candle_core::bail!("dense scratch must be on CUDA"),
+        };
+        let op = match &*os {
+            Storage::Cuda(c) => *c.as_cuda_slice::<half::f16>()?.device_ptr() as *mut u16,
+            _ => candle_core::bail!("output must be on CUDA"),
+        };
+        (ip, cp, csp, dp, op)
+    };
+    let column_ptr = match weight_row_scales {
+        Some(rs) => {
+            let (rs_s, _) = rs.storage_and_layout();
+            match &*rs_s {
+                Storage::Cuda(c) => *c.as_cuda_slice::<f32>()?.device_ptr() as *const f32,
+                _ => candle_core::bail!("weight_row_scales must be on CUDA"),
+            }
+        }
+        None => std::ptr::null(),
+    };
+
+    unsafe {
+        ffi::nvfp4_qpn4_dequantize_sm70(
+            codes_ptr,
+            scales_ptr,
+            weight_global_scale,
+            column_ptr,
+            dense_ptr,
+            n as i32,
+            k as i32,
+            stream,
+        );
+        ffi::nvfp4_qpn4_prefill_mm_sm70(
+            input_ptr,
+            dense_ptr,
+            out_ptr,
+            m as i32,
+            n as i32,
+            k as i32,
+            stream,
+        );
+    }
+    match bias {
+        Some(b) => output.broadcast_add(b),
+        None => Ok(output),
+    }
+}

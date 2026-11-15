@@ -2776,6 +2776,170 @@ __global__ void gated_delta_rule_recurrence_varlen_gqa_kernel(
     }
 }
 
+// =============================================================================
+// V13: 1Cat's SM70 production GDN kernel, ported verbatim from
+// flash_qla/ops/gated_delta_rule/chunk/sm70/csrc/gdn_forward.cu
+// ::gdn_forward_vlk_varlen_kernel (vLLM gdn_selector: head_k_dim==128 && sm70
+// ⇒ flashqla_sm70). Benchmarked as V13 in mmatest/bench_gdn_prefill.cu:
+// 8.045 ms vs 17.07 ms for the legacy kernel at the production shape, and
+// equal to it at bf16 output granularity (max_abs=0).
+//
+// Adaptations (values unchanged, addressing only):
+//   1. state/snapshot layout is ours, k-major [slot][vh][k_dim][v_dim], not
+//      their v-major VLK [vh][v][k];
+//   2. q_scale is fused into q at load (legacy semantics), not applied to the
+//      output;
+//   3. slots indirection + per-token state snapshots (MTP verify).
+// Their constants for K=V=128: cols=4, width=16, column_groups_per_block=2
+// ⇒ block=(32,2), grid=(v_heads, batch, 8).
+// =============================================================================
+
+__device__ __forceinline__ float gdn_subgroup_sum(float value, int width) {
+    for (int offset = width / 2; offset > 0; offset >>= 1)
+        value += __shfl_down_sync(0xffffffffu, value, offset, width);
+    return value;
+}
+
+__device__ __forceinline__ float gdn_subgroup_broadcast(float value, int width) {
+    return __shfl_sync(0xffffffffu, value, 0, width);
+}
+
+template <typename T, int K, int V, int COLS, int WIDTH>
+__global__ void gated_delta_rule_recurrence_varlen_gqa_v13_kernel(
+    const T* __restrict__ q, const T* __restrict__ k, const T* __restrict__ v,
+    const float* __restrict__ g, const float* __restrict__ beta,
+    float* __restrict__ state, const int64_t* __restrict__ slots,
+    T* __restrict__ out, float* __restrict__ state_snapshots,
+    const uint32_t* __restrict__ cu_seqlens, int num_v_heads, int num_k_heads,
+    float q_scale) {
+    static_assert(K % WIDTH == 0);
+    constexpr int subgroups_per_warp = GDN_WARP_SIZE / WIDTH;
+    constexpr int rows_per_lane = K / WIDTH;
+    const int hv = blockIdx.x;
+    const int n = blockIdx.y;
+    const int subgroup = threadIdx.x / WIDTH;
+    const int lane = threadIdx.x % WIDTH;
+    const int group_base =
+        (blockIdx.z * blockDim.y + threadIdx.y) * subgroups_per_warp + subgroup;
+    const int col_base = group_base * COLS;
+    const int hq = hv / (num_v_heads / num_k_heads);
+    const int64_t slot = slots[n];
+    if (slot < 0) return;
+    const int seq_start = static_cast<int>(cu_seqlens[n]);
+    const int seq_end = static_cast<int>(cu_seqlens[n + 1]);
+
+    float state_shard[COLS][rows_per_lane];
+#pragma unroll
+    for (int c = 0; c < COLS; ++c) {
+        const int col = col_base + c;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            const int row = r * WIDTH + lane;
+            state_shard[c][r] = (col < V)
+                ? state[((slot * num_v_heads + hv) * K + row) * V + col]
+                : 0.0f;
+        }
+    }
+
+    for (int t = seq_start; t < seq_end; ++t) {
+        const int64_t vh_index = (int64_t)t * num_v_heads + hv;
+        float gate_value = 0.0f;
+        float beta_value = 0.0f;
+        if (threadIdx.x == 0) {
+            gate_value = __expf(g[vh_index]);
+            beta_value = beta[vh_index];
+        }
+        gate_value = __shfl_sync(0xffffffffu, gate_value, 0);
+        beta_value = __shfl_sync(0xffffffffu, beta_value, 0);
+
+        float k_reg[rows_per_lane];
+        float q_reg[rows_per_lane];
+        float kv_partial[COLS];
+#pragma unroll
+        for (int c = 0; c < COLS; ++c) kv_partial[c] = 0.0f;
+
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            const int row = r * WIDTH + lane;
+            const int64_t qk_index = ((int64_t)t * num_k_heads + hq) * K + row;
+            q_reg[r] = to_float(q[qk_index]) * q_scale;
+            k_reg[r] = to_float(k[qk_index]);
+#pragma unroll
+            for (int c = 0; c < COLS; ++c)
+                kv_partial[c] =
+                    __fmaf_rn(state_shard[c][r], k_reg[r], kv_partial[c]);
+        }
+
+        float delta[COLS];
+#pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            const int col = col_base + c;
+            const float kv_col = gdn_subgroup_sum(kv_partial[c], WIDTH);
+            float delta_value = 0.0f;
+            if (lane == 0 && col < V)
+                delta_value =
+                    (to_float(v[vh_index * V + col]) - gate_value * kv_col) *
+                    beta_value;
+            delta[c] = gdn_subgroup_broadcast(delta_value, WIDTH);
+        }
+
+        float attn_partial[COLS];
+#pragma unroll
+        for (int c = 0; c < COLS; ++c) attn_partial[c] = 0.0f;
+
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+#pragma unroll
+            for (int c = 0; c < COLS; ++c) {
+                const float new_state = __fmaf_rn(
+                    k_reg[r], delta[c], gate_value * state_shard[c][r]);
+                state_shard[c][r] = new_state;
+                attn_partial[c] =
+                    __fmaf_rn(new_state, q_reg[r], attn_partial[c]);
+            }
+        }
+
+#pragma unroll
+        for (int c = 0; c < COLS; ++c)
+            attn_partial[c] = gdn_subgroup_sum(attn_partial[c], WIDTH);
+
+        if (lane == 0) {
+#pragma unroll
+            for (int c = 0; c < COLS; ++c) {
+                const int col = col_base + c;
+                if (col < V)
+                    out[vh_index * V + col] = from_float<T>(attn_partial[c]);
+            }
+        }
+        if (state_snapshots != nullptr) {
+#pragma unroll
+            for (int c = 0; c < COLS; ++c) {
+                const int col = col_base + c;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; ++r) {
+                    const int row = r * WIDTH + lane;
+                    if (col < V)
+                        state_snapshots[(vh_index * K + row) * V + col] =
+                            state_shard[c][r];
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int c = 0; c < COLS; ++c) {
+        const int col = col_base + c;
+        if (col < V) {
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+                const int row = r * WIDTH + lane;
+                state[((slot * num_v_heads + hv) * K + row) * V + col] =
+                    state_shard[c][r];
+            }
+        }
+    }
+}
+
 template <typename T>
 void launch_gated_delta_rule_recurrence_varlen_gqa(
     const T* q, const T* k, const T* v, const float* g, const float* beta,
@@ -2784,7 +2948,24 @@ void launch_gated_delta_rule_recurrence_varlen_gqa(
     int batch, int num_v_heads, int num_k_heads, int k_dim, int v_dim,
     float q_scale, cudaStream_t stream) {
 
-    if (k_dim == 128) {
+    if (k_dim == 128 && v_dim == 128 &&
+        (num_v_heads == 24 || num_v_heads == 48)) {
+        // 1Cat's tuned constants for these shapes (their
+        // get_column_groups_per_block: v_heads 24/48 ⇒ 2).
+        constexpr int COLS = 4;
+        constexpr int WIDTH = 16;
+        constexpr int GROUPS_PER_BLOCK = 2;
+        const int groups = (v_dim + COLS - 1) / COLS;
+        const int z = (groups + GROUPS_PER_BLOCK * (GDN_WARP_SIZE / WIDTH) - 1) /
+                      (GROUPS_PER_BLOCK * (GDN_WARP_SIZE / WIDTH));
+        dim3 grid(num_v_heads, batch, z);
+        dim3 block(GDN_WARP_SIZE, GROUPS_PER_BLOCK);
+        gated_delta_rule_recurrence_varlen_gqa_v13_kernel<
+            T, 128, 128, COLS, WIDTH>
+            <<<grid, block, 0, stream>>>(q, k, v, g, beta, state, slots, out,
+                                         state_snapshots, cu_seqlens,
+                                         num_v_heads, num_k_heads, q_scale);
+    } else if (k_dim == 128) {
         constexpr int WARPS_PER_BLOCK = 8;
         constexpr int BK = 128;
         dim3 grid((v_dim + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, batch * num_v_heads);

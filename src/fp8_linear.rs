@@ -263,6 +263,29 @@ fn fp8_matmul_channelwise(
         return Ok(output);
     }
 
+    // SM70 prefill fast path (1Cat QPN8 semantics): dequantize the channel-wise
+    // FP8 weights to F16 and run the tensor-core F16 GEMM. The generic
+    // channel-wise kernel sustains only ~90 GB/s on Volta because of its branchy
+    // FP32 shared-memory conversion; dequant + F16 tensor-core GEMM measured
+    // ~103 TF/s (bench_dense_gemm.cu), ~8x faster. The F16 weight store is
+    // lossless for the FP8 value (4 significant bits) and keeps 10 bits of the
+    // per-channel F32 scale, so rounding stays far below FP8's own step.
+    if sm_version < 80 && m >= 256 && input.dtype() == DType::F16 && (k & 7) == 0 {
+        let w_f16 = unsafe { Tensor::empty_((n, k), DType::F16, input.device())? };
+        let w_out = get_cuda_slice::<half::f16>(&w_f16)?;
+        unsafe {
+            ffi::fp8_dequant_channelwise_f16(
+                weight_ptr as *const u8,
+                scale_ptr as *const f32,
+                w_out as *mut core::ffi::c_void,
+                (n as i64 * k as i64) / 8,
+                (k / 8) as i32,
+                stream,
+            );
+        }
+        return input.matmul(&w_f16.t()?);
+    }
+
     unsafe {
         match input.dtype() {
             DType::F16 => ffi::fp8_matmul_f16_channelwise(

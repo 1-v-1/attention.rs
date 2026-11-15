@@ -2560,8 +2560,7 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
                     "gated_delta_rule_recurrence_varlen_gqa: unsupported dtype {:?}",
                     dt
                 ),
-            }
-            Ok(out)
+            }            Ok(out)
         }
         _ => {
             candle_core::bail!("Invalid device for gated_delta_rule_recurrence_varlen_gqa");

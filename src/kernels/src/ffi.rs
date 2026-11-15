@@ -1126,6 +1126,16 @@ extern "C" {
         stream: i64,
     );
 
+    /// SM70 prefill dequant (1Cat QPN8): channel-wise FP8 -> dense F16.
+    pub fn fp8_dequant_channelwise_f16(
+        w: *const u8,           // [N, K] packed FP8 bytes
+        scale: *const f32,      // [N], one scale per output row
+        out: *mut c_void,       // [N, K] F16
+        numel8: i64,            // N * K / 8
+        k_over_8: c_int,        // K / 8
+        stream: i64,
+    );
+
     /// SM70 (Volta) decode GEMV for channel-wise FP8 (M == 1).
     pub fn fp8_gemv_sm70_f16(
         input: *const c_void,     // [K]
@@ -3166,6 +3176,73 @@ extern "C" {
         weight_scale: *const u16,
         bias: *const c_void,
         output: *mut c_void,
+        n: c_int,
+        k: c_int,
+        stream: i64,
+    );
+
+    /// Repack NVFP4 weights into the SM70 QPN2 layout (1Cat port).
+    ///
+    /// `weight` is `[N, K/2]` packed u8 and `weight_scale` is `[N, K/16]`
+    /// E4M3 bytes; the outputs are the same shapes permuted into the QPN2
+    /// `[N/32][K/16][lane][uint2]` code layout and `[N/32][K/16][lane]`
+    /// scale layout the QPN2 kernels read.
+    pub fn nvfp4_qpn2_prepack_sm70(
+        weight: *const u8,
+        weight_scale: *const u8,
+        codes_out: *mut u8,
+        scales_out: *mut u8,
+        n: c_int,
+        k: c_int,
+        stream: i64,
+    );
+
+    /// QPN2 GEMM for SM70: `input` is `[m, k]` f16 (or K16-packed when the
+    /// Rust wrapper took the m > 16 route), output `[m, n]` f16.
+    pub fn nvfp4_qpn2_matmul_sm70(
+        input: *const u16,
+        codes: *const u8,
+        scales: *const u8,
+        global_scale: f32,
+        column_global_scale: *const f32,
+        bias: *const u16,
+        output: *mut u16,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        stream: i64,
+    );
+
+    /// Pack `[M, K]` f16 activations into the K16 layout the m32 kernel reads.
+    pub fn nvfp4_qpn2_pack_k16_sm70(
+        input: *const u16,
+        packed: *mut u16,
+        m: c_int,
+        k: c_int,
+        stream: i64,
+    );
+
+    /// QPN4 prefill route (M >= 256): materialize the QPN2 tile-major
+    /// codes/scales as a dense `[K, N]` f16 weight (k-major, same values the
+    /// QPN2 m32 route applies per lane).
+    pub fn nvfp4_qpn4_dequantize_sm70(
+        codes: *const u8,
+        scales: *const u8,
+        global_scale: f32,
+        column_global_scale: *const f32,
+        dense_out: *mut u16,
+        n: c_int,
+        k: c_int,
+        stream: i64,
+    );
+
+    /// Dense f16 GEMM with FP32 accumulation (cuBLAS): `input [m, k]` times
+    /// `dense_weight [k, n]` into `output [m, n]`.
+    pub fn nvfp4_qpn4_prefill_mm_sm70(
+        input: *const u16,
+        dense_weight: *const u16,
+        output: *mut u16,
+        m: c_int,
         n: c_int,
         k: c_int,
         stream: i64,
