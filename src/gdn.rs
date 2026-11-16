@@ -2568,6 +2568,95 @@ pub fn gated_delta_rule_recurrence_varlen_gqa(
     }
 }
 
+/// SM70 MTP verify (1Cat gdn_verify_sm70): run the T-step gated delta-rule
+/// recurrence in one kernel. The initial state is read from
+/// `src_state[src_slots[n]]`; each step's state is written to
+/// `state_snapshots[t]` (global token row), so the existing
+/// `rollback_mtp_verify_at` snapshot mechanism stays untouched. `qkv` is the
+/// convolved packed [T, 2H·KD | HV·KD] rows; `a`/`b` are the raw gating rows
+/// (the kernel applies softplus/sigmoid gating and L2-normalizes q/k itself).
+pub fn gdn_verify_mtp(
+    qkv: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    a_log: &Tensor,
+    dt_bias: &Tensor,
+    src_state: &Tensor,
+    src_slots: &Tensor,
+    state_snapshots: &Tensor,
+    cu_seqlens: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    let Device::Cuda(dev) = qkv.device() else {
+        candle_core::bail!("gdn_verify_mtp requires a CUDA device");
+    };
+    // The 1Cat verify kernel is half-native: packed qkv rows and the a/b gate
+    // vectors are read as half2. The qvar build runs GDN in F32, so narrow to
+    // the kernel's contract here (T is a handful of spec-decode tokens, so
+    // these casts are free).
+    let qkv = &qkv.to_dtype(DType::F16)?;
+    let a = &a.to_dtype(DType::F16)?;
+    let b = &b.to_dtype(DType::F16)?;
+    let (total_tokens, qkv_stride) = qkv.dims2()?;
+    let num_v_heads = state_snapshots.dim(1)?;
+    let kd = state_snapshots.dim(2)?;
+    if kd != 128 {
+        candle_core::bail!("gdn_verify_mtp kernel is fixed to KD=128, got {kd}");
+    }
+    let num_k_heads = (qkv_stride - num_v_heads * kd) / (2 * kd);
+    let n = src_slots.dim(0)?;
+    let tmax = total_tokens.div_ceil(n);
+    if tmax > 8 {
+        candle_core::bail!("gdn_verify_mtp supports at most 8 tokens per sequence, got {tmax}");
+    }
+    let src_slots_i32 = src_slots.to_dtype(DType::I64)?.contiguous()?;
+    let cu_i32 = cu_seqlens.to_dtype(DType::I64)?.contiguous()?;
+    let idx_i32 = Tensor::arange(0f32, total_tokens as f32, qkv.device())?
+    .to_dtype(DType::I64)?
+    .contiguous()?;
+    let o = Tensor::zeros((total_tokens, num_v_heads, kd), qkv.dtype(), qkv.device())?;
+    let stream = *dev.cu_stream() as i64;
+    unsafe {
+        ffi::gdn_verify_sm70(
+            get_cuda_const_ptr(qkv)?,
+            get_cuda_const_ptr(a)?,
+            get_cuda_const_ptr(b)?,
+            get_cuda_const_ptr(a_log)?,
+            get_cuda_const_ptr(dt_bias)?,
+            get_cuda_mut_ptr(state_snapshots)?,
+            get_cuda_mut_ptr(&o)?,
+            get_cuda_const_ptr_i64(&cu_i32)?,
+            get_cuda_const_ptr_i64(&idx_i32)?,
+            std::ptr::null(), // nacc: initial state comes from src_slots directly
+            n as c_int,
+            num_k_heads as c_int,
+            num_v_heads as c_int,
+            scale,
+            1, // cfg
+            (num_v_heads * kd * kd) as i64, // s_state
+            1,                              // s_idx
+            qkv_stride as c_int,
+            a.dim(1)? as c_int,
+            b.dim(1)? as c_int,
+            std::ptr::null(), // rbuf: non-replay route
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            tmax as c_int,
+            (a_log.dtype() == DType::F32) as c_int,
+            (dt_bias.dtype() == DType::F32) as c_int,
+            get_cuda_const_ptr(src_state)?,
+            (num_v_heads * kd * kd) as i64,
+            get_cuda_const_ptr_i64(&src_slots_i32)?,
+            stream,
+        );
+    }
+    Ok(o)
+}
+
 /// FlashInfer SM90 persistent GDN prefill for GQA models.
 /// Falls back to the regular recurrence kernel when FlashInfer is unavailable,
 /// the GPU is not SM90, or parameters are unsupported (k_dim != v_dim, etc.).

@@ -17,10 +17,13 @@ struct P {
   const half* a;
   const half* b;
   float* state;
+  const float* src;  // initial-state source (global state table)
+  long long s_src;  // src slot stride; src_slots[n] picks the sequence slot
+  const long long* src_slots;
   half* o;
-  const int* cu;
-  const int* idx;
-  const int* nacc;
+  const long long* cu;
+  const long long* idx;
+  const long long* nacc;
   long long s_state;  // state slot stride (elements)
   int s_idx;          // ssm_state_indices row stride
   int qkv_stride;
@@ -31,18 +34,18 @@ struct P {
   // round's normalized k [TMAX][H][KD], raw v [TMAX][HV][KD] and (decay, beta)
   // [TMAX][HV][2], fp32.
   float* rbuf;
-  const int* rn;  // tokens of the previous round to replay (its accepted
+  const long long* rn;  // tokens of the previous round to replay (its accepted
                   // count), per sequence
   unsigned* ctr;  // [round, finished CTAs]
   int nmax;
   // Per-sequence replay slot and buffer side: rmap[n] = 2 * slot + side.
   // The round writes side `side` and replays side `side ^ 1`. Null: the
   // shared round counter `ctr` selects the side and slot = n.
-  const int* rmap;
+  const long long* rmap;
   // Current-round token index whose state is also stored to state slot
   // cks[n] (an aligned prefix checkpoint inside the round), -1 for none.
-  const int* ckt;
-  const int* cks;
+  const long long* ckt;
+  const long long* cks;
 };
 
 __device__ __forceinline__ long long seq_floats(int H, int HV) {
@@ -83,7 +86,7 @@ __global__ __launch_bounds__(WARPS * 32, (WARPS <= 4 ? 8 : 4)) void gdn_verify(
             h = hv / (p.HV / p.H);
   const int bos = p.cu[n], T = p.cu[n + 1] - bos;
   // Replay mode commits the previous round even without current tokens.
-  const int R0 = REPLAY ? min(p.rn[n], TMAX) : 0;
+  const int R0 = REPLAY ? (int)min(p.rn[n], (long long)TMAX) : 0;
   if (T <= 0 && R0 <= 0) {
     if (REPLAY && !p.rmap) round_done(p);
     return;
@@ -103,12 +106,16 @@ __global__ __launch_bounds__(WARPS * 32, (WARPS <= 4 ? 8 : 4)) void gdn_verify(
   // Issue state loads immediately so HBM latency overlaps with parallel
   // Q/K/V/gate precompute across the CTA's warps.
   float4 st[ROWS];
+  const long long src_slot = p.src_slots ? p.src_slots[n] : slot0;
+  const long long src_stride = p.src_slots ? p.s_src : p.s_state;
+  // xinfer state layout is [slots, HV, K, V]: element (k=lane*4+e, v=row0+j),
+  // so the kernel's row dim carries V and the float4 dim carries K.
 #pragma unroll
   for (int j = 0; j < ROWS; ++j) {
-    st[j] = __ldcg(
-        reinterpret_cast<const float4*>(p.state + slot0 * p.s_state +
-                                        ((long long)hv * KD + row0 + j) * KD) +
-        lane);
+    const float* sp = p.src + src_slot * src_stride +
+                      ((long long)hv * KD + lane * 4) * KD + row0 + j;
+    st[j] = make_float4(__ldcg(sp), __ldcg(sp + KD), __ldcg(sp + 2 * KD),
+                        __ldcg(sp + 3 * KD));
   }
 
   __shared__ GdnVerifySmem<TT, CTA_ROWS, REPLAY> smem;
@@ -244,10 +251,12 @@ __global__ __launch_bounds__(WARPS * 32, (WARPS <= 4 ? 8 : 4)) void gdn_verify(
     if (R0 > 0) {
 #pragma unroll
       for (int j = 0; j < ROWS; ++j) {
-        __stcg(reinterpret_cast<float4*>(p.state + slot0 * p.s_state +
-                                         ((long long)hv * KD + row0 + j) * KD) +
-                   lane,
-               make_float4(hs[j][0], hs[j][1], hs[j][2], hs[j][3]));
+        float* dp = p.state + slot0 * p.s_state +
+                    ((long long)hv * KD + lane * 4) * KD + row0 + j;
+        __stcg(dp, hs[j][0]);
+        __stcg(dp + KD, hs[j][1]);
+        __stcg(dp + 2 * KD, hs[j][2]);
+        __stcg(dp + 3 * KD, hs[j][3]);
       }
     }
   }
@@ -297,11 +306,14 @@ __global__ __launch_bounds__(WARPS * 32, (WARPS <= 4 ? 8 : 4)) void gdn_verify(
                           : p.idx[n * p.s_idx + t];
     if (sl >= 0) {
 #pragma unroll
-      for (int j = 0; j < ROWS; ++j)
-        __stcg(reinterpret_cast<float4*>(p.state + sl * p.s_state +
-                                         ((long long)hv * KD + row0 + j) * KD) +
-                   lane,
-               make_float4(hs[j][0], hs[j][1], hs[j][2], hs[j][3]));
+      for (int j = 0; j < ROWS; ++j) {
+        float* dp = p.state + sl * p.s_state +
+                    ((long long)hv * KD + lane * 4) * KD + row0 + j;
+        __stcg(dp, hs[j][0]);
+        __stcg(dp + KD, hs[j][1]);
+        __stcg(dp + 2 * KD, hs[j][2]);
+        __stcg(dp + 3 * KD, hs[j][3]);
+      }
     }
   }
   if (REPLAY && !p.rmap) round_done(p);
@@ -309,12 +321,13 @@ __global__ __launch_bounds__(WARPS * 32, (WARPS <= 4 ? 8 : 4)) void gdn_verify(
 }  // namespace
 extern "C" void gdn_verify_sm70(
     const void* qkv, const void* a, const void* b, const void* a_log,
-    const void* dt_bias, void* state, void* o, const int* cu, const int* idx,
-    const int* nacc, int n, int h, int hv, float scale, int cfg,
+    const void* dt_bias, void* state, void* o, const long long* cu, const long long* idx,
+    const long long* nacc, int n, int h, int hv, float scale, int cfg,
     long long s_state, int s_idx, int qkv_stride, int lda, int ldb,
-    const void* rbuf, const int* rn, unsigned* ctr, long long nmax,
-    const int* rmap, const int* ckt, const int* cks, int tmax,
-    int a_log_is_f32, int dt_bias_is_f32, void* stream) {
+    const void* rbuf, const long long* rn, unsigned* ctr, long long nmax,
+    const long long* rmap, const long long* ckt, const long long* cks, int tmax,
+    int a_log_is_f32, int dt_bias_is_f32, const void* src, long long s_src,
+    const long long* src_slots, void* stream) {
   P p{};
   p.qkv = reinterpret_cast<const half*>(qkv);
   p.a = reinterpret_cast<const half*>(a);
@@ -324,6 +337,8 @@ extern "C" void gdn_verify_sm70(
   p.cu = cu; p.idx = idx; p.nacc = nacc;
   p.s_state = s_state; p.s_idx = s_idx; p.qkv_stride = qkv_stride;
   p.H = h; p.HV = hv; p.scale = scale; p.lda = lda; p.ldb = ldb;
+  p.src = reinterpret_cast<const float*>(src);
+  p.s_src = s_src; p.src_slots = src_slots;
   const bool replay = rbuf != nullptr;
   if (replay) {
     p.rbuf = const_cast<float*>(reinterpret_cast<const float*>(rbuf));
