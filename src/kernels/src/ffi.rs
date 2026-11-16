@@ -1225,6 +1225,21 @@ extern "C" {
         stream: i64,
     );
 
+    /// SM70 one-shot allreduce (1Cat flashinfer one-shot): IPC staging slot
+    /// + parity flag fold. oneshot_alloc/oneshot_open exchange 64B handles.
+    #[allow(non_upper_case_globals)]
+    pub fn oneshot_alloc(cap_bytes: usize, out_own_ptr: *mut u64,
+                         out_handle_bytes: *mut u8);
+    #[allow(non_upper_case_globals)]
+    pub fn oneshot_open(handle_bytes: *const u8, out_peer_ptr: *mut u64);
+    #[allow(non_upper_case_globals)]
+    pub fn oneshot_clear(p: *mut c_void, bytes: usize);
+    #[allow(non_upper_case_globals)]
+    pub fn oneshot_fold(input: *const c_void, output: *mut c_void,
+                        own: *mut c_void, peer: *mut c_void,
+                        epoch_ptr: *mut u32, slot_stride: u32, n: u32,
+                        rank: u32, stream: i64);
+
     /// SM70 (Volta) decode GEMV for channel-wise FP8 (M == 1).
     pub fn fp8_gemv_sm70_f16(
         input: *const c_void,     // [K]

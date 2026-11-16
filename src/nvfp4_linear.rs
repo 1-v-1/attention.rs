@@ -356,6 +356,9 @@ mod sm70_weight_cache {
                 return Ok((entry.weight.clone(), entry.scale.clone()));
             }
         }
+        if std::env::var("XINFER_NVFP4_DEBUG").is_ok() {
+            eprintln!("NVFP4 repack MISS key={:?} n={} k={}", key, n, k);
+        }
 
         let (repacked_weight, repacked_scale) =
             crate::nvfp4_linear::nvfp4_repack_weight_sm70(

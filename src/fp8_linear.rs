@@ -109,8 +109,6 @@ pub fn fp8_matmul_with_input_scale(
         let (scale_n, scale_k) = weight_scale.dims2()?;
         let (_, k) = input.dims2()?;
         if weight_scale.dtype() == DType::F16
-            && block_size[0] == 1
-            && block_size[1] % k == 0
             && k == k_w
             && (scale_n, scale_k) == (1, n)
         {
@@ -316,6 +314,14 @@ fn fp8_matmul_channelwise(
 ) -> Result<Tensor> {
     let (m, k) = input.dims2()?;
     let (n, k_w) = weight.dims2()?;
+    if std::env::var("XINFER_QPN8_DEBUG").is_ok() {
+        static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(usize, usize, usize)>>> =
+            std::sync::OnceLock::new();
+        if S.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+            .lock().unwrap().insert((m, n, k)) {
+            eprintln!("CHW m={} n={} k={}", m, n, k);
+        }
+    }
     if k != k_w {
         candle_core::bail!(
             "Shape mismatch in channel-wise fp8_matmul: input [{}, {}], weight [{}, {}]",
