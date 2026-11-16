@@ -115,6 +115,44 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/flash/flash_prefill_tq3.cuh");
     println!("cargo:rerun-if-changed=src/flash/flash_sm_compat.cuh");
 
+    // Roadmap 坑 B: this list was hand-maintained and 25 sources were never
+    // registered, so editing them silently produced no rebuild and the measured
+    // numbers were fake. Registered now, in particular the two the MTP work
+    // depends on (`gdn_verify_sm70.cu`, `oneshot_allreduce_sm70.cu`).
+    println!("cargo:rerun-if-changed=src/paged_attention_v1.cu");
+    println!("cargo:rerun-if-changed=src/paged_attention_v2.cu");
+    println!("cargo:rerun-if-changed=src/gptq_cuda_kernel.cu");
+    println!("cargo:rerun-if-changed=src/dsa_lightning_indexer.cu");
+    println!("cargo:rerun-if-changed=src/gdn_verify_sm70.cu");
+    println!("cargo:rerun-if-changed=src/oneshot_allreduce_sm70.cu");
+    println!("cargo:rerun-if-changed=src/gguf/gguf.cuh");
+    for path in [
+        "marlin.cuh",
+        "marlin_dtypes.cuh",
+        "marlin_cuda_kernel.cuh",
+        "marlin_gptq_cuda_kernel.cuh",
+        "marlin_repack.cu",
+        "marlin_matmul_bf16.cu",
+        "marlin_matmul_f16.cu",
+        "marlin_matmul_awq_bf16.cu",
+        "marlin_matmul_awq_f16.cu",
+    ] {
+        println!("cargo:rerun-if-changed=src/{path}");
+    }
+    for path in [
+        "attention_utils.cuh",
+        "attention_generic.cuh",
+        "dtype_float32.cuh",
+        "dtype_float16.cuh",
+        "dtype_bfloat16.cuh",
+        "dtype_fp8.cuh",
+        "dtype_e8m0.cuh",
+    ] {
+        println!("cargo:rerun-if-changed=src/attention/{path}");
+    }
+    println!("cargo:rerun-if-changed=src/moe/moe_utils.cuh");
+    println!("cargo:rerun-if-changed=src/moe/topk_softmax_kernels.cu");
+
     let marlin_disabled = std::env::var("CARGO_FEATURE_NO_MARLIN").is_ok();
     let fp8_kvcache_disabled = std::env::var("CARGO_FEATURE_NO_FP8_KVCACHE").is_ok();
     let trtllm_enabled = std::env::var("CARGO_FEATURE_TRTLLM").is_ok();
