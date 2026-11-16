@@ -49,6 +49,7 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/gpu_sampling.cu");
     println!("cargo:rerun-if-changed=src/fused_rope.cu");
     println!("cargo:rerun-if-changed=src/fp8_matmul.cu");
+    println!("cargo:rerun-if-changed=src/fp8_qpn8_sm70.cu");
     println!("cargo:rerun-if-changed=src/fp8_gemm_cutlass.cu");
     println!("cargo:rerun-if-changed=src/fp8_moe_cutlass.cu");
     println!("cargo:rerun-if-changed=src/flashinfer_fp8_qquant.cu");

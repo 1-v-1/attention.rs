@@ -110,6 +110,9 @@ pub fn fp8_matmul_with_input_scale(
             && k == k_w
             && (scale_n, scale_k) == (n, 1)
         {
+            if let Some(out) = fp8_qpn8_channelwise(&input, weight, weight_scale)? {
+                return Ok(out);
+            }
             return fp8_matmul_channelwise(&input, weight, weight_scale);
         }
     }
@@ -167,6 +170,108 @@ pub fn fp8_matmul_with_input_scale(
     }
 
     fp8_matmul_fallback(&input, weight, weight_scale, block_size)
+}
+
+/// SM70 QPN8 fast path for channel-wise FP8 weights on 2..=40 tokens (1Cat
+/// fp8_qpn8_sm70).  The [N, K] row-major weight is repacked into tile-major
+/// lane-permuted [K, N] codes plus F16 channel scales; the GEMM reads the
+/// codes directly, so the weight bytes are touched exactly once per call
+/// instead of being dequantized into an F16 temporary first.  Returns
+/// `Ok(None)` when the shape or platform does not match a QPN8 contract and
+/// the caller must keep the generic path.
+#[cfg(feature = "cuda")]
+fn fp8_qpn8_channelwise(
+    input: &Tensor,
+    weight: &Tensor,
+    weight_scale: &Tensor,
+) -> Result<Option<Tensor>> {
+    let (m, k) = input.dims2()?;
+    let (n, _) = weight.dims2()?;
+    let Ok(cuda_dev) = input.device().as_cuda_device() else {
+        return Ok(None);
+    };
+    let sm = crate::cuda_utils::sm_version(cuda_dev).unwrap_or(0) as usize;
+    // Volta-only; F16 activations; the QPN8 contracts are N%32=K%16=0 and a
+    // split-K that divides K/16 exactly.  M=1 stays on the tuned GEMV and
+    // prefill on the dequant+cublas path.
+    if sm >= 80
+        || input.dtype() != DType::F16
+        || m < 2
+        || m > 40
+        || n % 32 != 0
+        || k % 16 != 0
+    {
+        return Ok(None);
+    }
+    let groups = k / 16;
+    let cands: &[usize] = if m <= 8 {
+        &[32, 16, 8, 4]
+    } else if m <= 16 {
+        &[16, 8, 4]
+    } else {
+        &[16, 8]
+    };
+    let Some(&split_k) = cands.iter().find(|s| groups % **s == 0) else {
+        return Ok(None);
+    };
+    // The m32 two-phase kernel reads the [K/16, M, 16] activation twin on
+    // large dense projections (mirrors the upstream packed-input condition).
+    let packed = m > 16 && n >= 2048 && k >= 4096;
+    // Repack per call: the layer keeps owning the row-major FP8 weight, so a
+    // persistent packed twin would double weight memory.  The traffic still
+    // beats dequant+cublas (one FP8 read + one FP8 write + one FP8 read vs
+    // one FP8 read + two F16 writes + two F16 reads).
+    let weight = weight.contiguous()?;
+    let weight_scale = weight_scale.contiguous()?;
+    let codes = unsafe { Tensor::empty_((k, n), DType::U8, input.device())? };
+    let group_scales = unsafe { Tensor::empty_((1, n), DType::F16, input.device())? };
+    let stream = *cuda_dev.cu_stream() as i64;
+    unsafe {
+        ffi::fp8_qpn8_prepare_f16(
+            get_cuda_slice::<u8>(&codes)? as *mut u8,
+            get_cuda_slice::<half::f16>(&group_scales)? as *mut core::ffi::c_void,
+            get_cuda_slice::<u8>(&weight)? as *const u8,
+            get_cuda_slice::<f32>(&weight_scale)? as *const f32,
+            n as i32,
+            k as i32,
+            stream,
+        );
+    }
+
+    let input = if packed {
+        let twin = unsafe { Tensor::empty_((m, k), DType::F16, input.device())? };
+        let stream = *cuda_dev.cu_stream() as i64;
+        unsafe {
+            ffi::fp8_qpn8_pack_input_f16(
+                get_cuda_slice::<half::f16>(input)? as *const core::ffi::c_void,
+                get_cuda_slice::<half::f16>(&twin)? as *mut core::ffi::c_void,
+                m as i32,
+                k as i32,
+                stream,
+            );
+        }
+        twin
+    } else {
+        input.clone()
+    };
+
+    let output = unsafe { Tensor::empty_((m, n), DType::F16, input.device())? };
+    let stream = *cuda_dev.cu_stream() as i64;
+    unsafe {
+        ffi::fp8_qpn8_gemm_f16(
+            get_cuda_slice::<half::f16>(&input)? as *const core::ffi::c_void,
+            get_cuda_slice::<u8>(&codes)? as *const u8,
+            get_cuda_slice::<half::f16>(&group_scales)? as *const core::ffi::c_void,
+            get_cuda_slice::<half::f16>(&output)? as *mut core::ffi::c_void,
+            m as i32,
+            n as i32,
+            k as i32,
+            split_k as i32,
+            packed as i32,
+            stream,
+        );
+    }
+    Ok(Some(output))
 }
 
 /// FP8 W8A16 matrix multiplication for one scale per output channel.

@@ -1126,6 +1126,43 @@ extern "C" {
         stream: i64,
     );
 
+    /// SM70 QPN8 channel-wise FP8 path (1Cat fp8_qpn8_sm70): split the [N, K]
+    /// row-major weight into tile-major lane-permuted [K, N] codes + F16
+    /// channel scales (x256), then run the m8n8k4 QPN8 GEMM on 2..=40 tokens.
+    #[allow(non_upper_case_globals)]
+    pub fn fp8_qpn8_prepare_f16(
+        codes: *mut u8, // [K, N] packed
+        group_scales: *mut c_void, // [1, N] f16
+        qweight: *const u8,        // [N, K] row-major fp8 bytes
+        scales: *const f32,        // [N, 1] f32
+        n: c_int,
+        k: c_int,
+        stream: i64,
+    );
+
+    #[allow(non_upper_case_globals)]
+    pub fn fp8_qpn8_pack_input_f16(
+        input: *const c_void, // [M, K] f16
+        packed: *mut c_void,  // [K/16, M, 16] f16 twin
+        m: c_int,
+        k: c_int,
+        stream: i64,
+    );
+
+    #[allow(non_upper_case_globals)]
+    pub fn fp8_qpn8_gemm_f16(
+        input: *const c_void,
+        codes: *const u8,
+        group_scales: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        split_k: c_int,
+        input_is_packed: c_int,
+        stream: i64,
+    );
+
     /// SM70 GDN target-verification recurrent update (1Cat gdn_verify_sm70):
     /// packed [T, q|k|v] rows + cu_seqlens + state slots, state updated in
     /// place, only accepted tokens commit. `rbuf` null = non-replay.
