@@ -303,6 +303,24 @@ pub struct InputMetadata {
     pub is_mtp_verify: bool,
 }
 
+impl InputMetadata {
+    /// Per-sequence token count for the current step, derived the way the
+    /// reference does it: `num_accepted_tokens = torch.diff(query_start_loc)`.
+    /// `cu_seqlens_q` is that cumsum, so the token axis is read off it instead
+    /// of being re-derived from the sequence count at every call site.
+    pub fn num_accepted_tokens(&self) -> Option<Tensor> {
+        let q = self.cu_seqlens_q.as_ref()?;
+        let starts = q.to_vec1::<u32>().ok()?;
+        let lens = starts[1..]
+            .iter()
+            .zip(starts[..starts.len() - 1].iter())
+            .map(|(&hi, &lo)| hi - lo)
+            .collect::<Vec<_>>();
+        let n = lens.len();
+        Tensor::from_vec(lens, (n,), q.device()).ok()
+    }
+}
+
 #[allow(dead_code)]
 pub struct PagedAttention {
     num_attention_heads: usize,

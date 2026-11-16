@@ -487,6 +487,7 @@ pub fn nvfp4_matmul(
                 && n % 32 == 0
                 && k % 32 == 0;
 
+            if m > 1 && std::env::var("XINFER_ONESHOT_DEBUG").is_ok() { eprintln!("[nvfp4] call m={m} n={n} k={k} dtype={dtype:?} pre={prepacked_sm70} sw={}", weight_scale_swizzled.is_some()); }
             let output = Tensor::zeros((m, n), dtype, dev)?;
             let has_bias = bias.is_some();
 
@@ -830,6 +831,25 @@ pub fn nvfp4_matmul(
                 };
 
                 let stream = *cuda_dev.cu_stream() as i64;
+                // SM70 verify fast path (QPN8 semantics): dequant to F16 and run the
+                // tensor-core F16 GEMM. The HMMA.884 path sustains only ~107 GB/s on
+                // Volta; dequant + F16 GEMM measured ~103 TF/s, ~4x faster.
+                if m > 1 && dtype == DType::F16 && (k & 15) == 0 {
+                    if std::env::var("XINFER_ONESHOT_DEBUG").is_ok() { eprintln!("[nvfp4] fast m={m} n={n} k={k}"); }
+                    let w_f16 = Tensor::zeros((n, k), DType::F16, input.device())?;
+                    let (wf_s, _) = w_f16.storage_and_layout();
+                    let wf_ptr = cuda_ptr(&wf_s, DType::F16)? as *mut std::ffi::c_void;
+                    unsafe {
+                        ffi::nvfp4_dequant_f16_sm70(
+                            weight_ptr, scale_ptr, wf_ptr as *mut u16,
+                            n as i32, k as i32, stream);
+                    }
+                    let mut o = input.matmul(&w_f16.t()?)?;
+                    if let Some(b) = bias {
+                        o = o.broadcast_add(b)?;
+                    }
+                    return Ok(o);
+                }
 
                 unsafe {
                     if m == 1 {
@@ -1793,6 +1813,28 @@ pub fn nvfp4_matmul_hmma884(
     };
     let (input_ptr, weight_ptr, scale_ptr, output_ptr, bias_ptr, row_scales_ptr) = pointers;
 
+
+    // SM70 verify fast path (QPN8 semantics): dequant to F16 and run the
+    // tensor-core F16 GEMM. The HMMA.884 path sustains only ~107 GB/s on Volta;
+    // dequant + F16 GEMM measured ~103 TF/s, ~4x faster.
+    if m > 1 && dtype == DType::F16 && (k & 15) == 0 {
+        let w_f16 = Tensor::zeros((n, k), DType::F16, dev)?;
+        let (wf_s, _) = w_f16.storage_and_layout();
+        let wf_ptr = match &*wf_s {
+            candle_core::Storage::Cuda(c) =>
+                *c.as_cuda_slice::<half::f16>()?.device_ptr() as *mut u16,
+            _ => candle_core::bail!("w_f16 must be on CUDA"),
+        };
+        if std::env::var("XINFER_ONESHOT_DEBUG").is_ok() { eprintln!("[nvfp4] fast m={m} n={n} k={k}"); }
+        unsafe {
+            ffi::nvfp4_dequant_f16_sm70(weight_ptr, scale_ptr, wf_ptr, n as i32, k as i32, stream);
+        }
+        let mut o = input.matmul(&w_f16.t()?)?;
+        if let Some(b) = bias {
+            o = o.broadcast_add(b)?;
+        }
+        return Ok(o);
+    }
     unsafe {
         ffi::nvfp4_matmul_hmma884_f16(
             input_ptr as *const std::ffi::c_void,

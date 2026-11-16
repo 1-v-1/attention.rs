@@ -3285,6 +3285,16 @@ extern "C" {
         stream: i64,
     );
 
+    /// SM70 verify fast path (QPN8 semantics): dequant the repacked NVFP4 weight to F16.
+    pub fn nvfp4_dequant_f16_sm70(
+        weight: *const u32,
+        weight_scale: *const u16,
+        output: *mut u16,
+        n: c_int,
+        k: c_int,
+        stream: i64,
+    );
+
     /// Repack NVFP4 weights into the SM70 QPN2 layout (1Cat port).
     ///
     /// `weight` is `[N, K/2]` packed u8 and `weight_scale` is `[N, K/16]`

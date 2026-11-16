@@ -844,6 +844,57 @@ extern "C" void nvfp4_gemv_sm70_f16(const __half *input, const uint32_t *weight,
 }
 
 // ---------------------------------------------------------------------------
+// SM70 verify fast path (QPN8 semantics, same as the fp8 channelwise path).
+//
+// When m>1 (MTP verify) the HMMA.884 path sustains only ~107 GB/s on Volta:
+// the branchy FP32 shared-memory conversion leaves one warp per SM with every
+// stall exposed.  Dequantizing the repacked NVFP4 weight to F16 and running
+// the tensor-core F16 GEMM measured ~103 TF/s on the fp8 path
+// (bench_dense_gemm.cu), ~4x faster.  The F16 store is lossless for the E2M1
+// value (4 significant bits) and keeps 10 bits of the F32 scale product, so
+// rounding stays far below the NVFP4 step.
+// ---------------------------------------------------------------------------
+__global__ void nvfp4_dequant_f16_sm70_kernel(
+    const uint32_t *__restrict__ weight,
+    const uint16_t *__restrict__ weight_scale, uint16_t *__restrict__ out,
+    int N, int K) {
+  // One thread per (n, 16-element scale group), like the repack kernel.
+  const int scales_per_row = K / 16;
+  const int total = N * scales_per_row;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  const int n = idx / scales_per_row;
+  const int group = idx % scales_per_row;
+  const uint32_t s = weight_scale[idx];
+  const uint32_t s2 = s | (s << 16);
+  const uint32_t *src = weight + (size_t)n * (K / 8) + group * 2;
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    uint32_t dec[4];
+    sm70_nvfp4::decode_fp4_e2m1_x8(src[half], s2, dec);
+    // dec[j] = (e_{4h+j}, e_{4h+j+4}) halves; the output wants e0..e7
+    // contiguous, so pair lo/lo and hi/hi across the words.
+    uint4 o;
+    o.x = (dec[0] & 0xFFFFu) | (dec[1] << 16);
+    o.y = (dec[2] & 0xFFFFu) | (dec[3] << 16);
+    o.z = (dec[0] >> 16) | (dec[1] & 0xFFFF0000u);
+    o.w = (dec[2] >> 16) | (dec[3] & 0xFFFF0000u);
+    *reinterpret_cast<uint4 *>(out + (size_t)n * K + group * 16 + half * 8) = o;
+  }
+}
+
+extern "C" void nvfp4_dequant_f16_sm70(const uint32_t *weight,
+                                       const uint16_t *weight_scale,
+                                       uint16_t *output, int N, int K,
+                                       cudaStream_t stream) {
+  if (N <= 0 || K <= 0 || (K & 15) != 0) return;
+  const int total = N * (K / 16);
+  nvfp4_dequant_f16_sm70_kernel<<<(total + 255) / 256, 256, 0,
+                                             stream>>>(weight, weight_scale,
+                                                       output, N, K);
+}
+
+// ---------------------------------------------------------------------------
 // Device-side cross-check of the SM70 repack.
 //
 // The repack rewrites the weight into the layout the HMMA.884 atom expects
