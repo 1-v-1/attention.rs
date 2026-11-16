@@ -98,6 +98,38 @@ __global__ void fp8_qpn8_channel_scale_sm70_kernel(
   }
 }
 
+__global__ void fp8_qpn8_dequantize_sm70_kernel(
+    half* __restrict__ output, const uint8_t* __restrict__ codes,
+    const half* __restrict__ group_scales, int n, int k) {
+  const size_t word_index =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t word_count = static_cast<size_t>(n) * k / 16;
+  if (word_index >= word_count) {
+    return;
+  }
+
+  const int groups_k16 = k >> 4;
+  const int lane = static_cast<int>(word_index & 31);
+  const size_t tile_word = word_index >> 5;
+  const int group = static_cast<int>(tile_word % groups_k16);
+  const int tile = static_cast<int>(tile_word / groups_k16);
+  const int col = tile * 32 + qpn8_col_from_lane(lane);
+  const half scale = group_scales[col];
+  const half2 scale2 = __halves2half2(scale, scale);
+  const uint4 packed = reinterpret_cast<const uint4*>(codes)[word_index];
+  half2 weights[8];
+  fp8x8_to_half2x4_fast(make_uint2(packed.x, packed.y), weights);
+  fp8x8_to_half2x4_fast(make_uint2(packed.z, packed.w), weights + 4);
+
+#pragma unroll
+  for (int pair = 0; pair < 8; ++pair) {
+    const half2 value = __hmul2(weights[pair], scale2);
+    const int k_base = group * 16 + pair * 2;
+    output[static_cast<size_t>(k_base) * n + col] = __low2half(value);
+    output[static_cast<size_t>(k_base + 1) * n + col] = __high2half(value);
+  }
+}
+
 __global__ void fp8_qpn8_silu_and_mul_sm70_kernel(
     half* __restrict__ output, const half* __restrict__ gate_up, int rows,
     int hidden) {
@@ -590,7 +622,26 @@ extern "C" void fp8_qpn8_gemm_f16(const half* input, const uint8_t* codes,
                                  int n, int k, int split_k,
                                  int input_is_packed, cudaStream_t stream) {
   const bool packed = input_is_packed != 0;
-  if (m <= 8) {
+  if (m == 1) {
+    switch (split_k) {
+      case 4:
+        launch_fp8_qpn8_sm70<4, 1, true, false, true>(codes, group_scales, input,
+                                                     output, n, k, m, true, stream);
+        break;
+      case 8:
+        launch_fp8_qpn8_sm70<8, 1, true, false, true>(codes, group_scales, input,
+                                                     output, n, k, m, true, stream);
+        break;
+      case 16:
+        launch_fp8_qpn8_sm70<16, 1, true, false, true>(codes, group_scales, input,
+                                                      output, n, k, m, true, stream);
+        break;
+      default:
+        launch_fp8_qpn8_sm70<32, 1, true, false, true>(codes, group_scales, input,
+                                                      output, n, k, m, true, stream);
+        break;
+    }
+  } else if (m <= 8) {
     switch (split_k) {
       case 4:
         launch_fp8_qpn8_sm70<4, 1, true, false>(codes, group_scales, input,
@@ -610,6 +661,8 @@ extern "C" void fp8_qpn8_gemm_f16(const half* input, const uint8_t* codes,
         break;
     }
   } else if (m <= 16) {
+    // Two row tiles cover up to 16 activations; the m32 two-phase kernel
+    // strides 16 rows per block and would re-read codes at small m.
     switch (split_k) {
       case 4:
         launch_fp8_qpn8_sm70<4, 2, true, false, false, 2>(
@@ -641,4 +694,15 @@ extern "C" void fp8_qpn8_gemm_f16(const half* input, const uint8_t* codes,
                                            n, k, m, stream);
     }
   }
+}
+
+// Channel-wise dequant for prefill: packed codes -> dense [K, N] F16 twin.
+extern "C" void fp8_qpn8_dequantize_f16(const uint8_t* codes,
+                                        const half* group_scales, half* output,
+                                        int n, int k, cudaStream_t stream) {
+  const size_t word_count = static_cast<size_t>(n) * k / 16;
+  const int block = 256;
+  const int grid = static_cast<int>((word_count + block - 1) / block);
+  fp8_qpn8_dequantize_sm70_kernel<<<grid, block, 0, stream>>>(output, codes,
+                                                             group_scales, n, k);
 }

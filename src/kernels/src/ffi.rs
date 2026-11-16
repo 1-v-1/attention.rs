@@ -1163,6 +1163,17 @@ extern "C" {
         stream: i64,
     );
 
+    /// Channel-wise dequant for prefill: packed codes -> dense [K, N] F16 twin.
+    #[allow(non_upper_case_globals)]
+    pub fn fp8_qpn8_dequantize_f16(
+        codes: *const u8,
+        group_scales: *const c_void,
+        output: *mut c_void,
+        n: c_int,
+        k: c_int,
+        stream: i64,
+    );
+
     /// SM70 GDN target-verification recurrent update (1Cat gdn_verify_sm70):
     /// packed [T, q|k|v] rows + cu_seqlens + state slots, state updated in
     /// place, only accepted tokens commit. `rbuf` null = non-replay.
