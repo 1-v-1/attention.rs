@@ -375,159 +375,6 @@ __global__ void fp8_wmma_matmul(
 
 // Channel-wise compressed-tensors FP8 uses one F32 scale for every output
 // row: scale[n] applies to all K values of weight[n, :].  The WMMA path above
-// ---------------------------------------------------------------------------
-// SM70 decode GEMV for channel-wise FP8 (M == 1).
-//
-// The generic `fp8_matmul_kernel` dequantizes every single weight into FP32
-// shared memory using the branchy software FP8->FP32 conversion, which costs
-// roughly 25 instructions per weight and leaves the memory system idle: on a
-// V100 it sustains 86-96 GB/s while a plain read of the same bytes reaches
-// 818 GB/s.
-//
-// This kernel uses the layout 1Cat's dense SM70 kernels use:
-//   * one warp owns one output column and the 32 lanes split K in stripes
-//     (lane l takes k-block l, l+32, ...), so the weight and activation loads
-//     are fully coalesced and no shared-memory staging is needed;
-//   * the weights are decoded straight from global memory into registers with
-//     a branch-free bit trick;
-//   * the products are accumulated in FP32, which is exact for F16 x F16.
-//
-// The result is bit-identical to `fp8_matmul_kernel` for channel-wise scales
-// (verified against a double-precision CPU reference on the 27B shapes).
-// ---------------------------------------------------------------------------
-__device__ __forceinline__ void fp8_e4m3x8_to_half2x4(uint2 q, uint32_t out[4]) {
-  // E4M3 (OCP) -> F16.  The plain trick `((code & 0x7f) << 7)` yields the
-  // value scaled by 2^-8 (1Cat compensates by folding 256 into the block
-  // scale); adding 0x2000 restores the exponent bias so that the F16
-  // exponent field ends up as (E4M3 exponent + 8).  The addition cannot carry
-  // past bit 14 because that bit is zero before it.
-  constexpr unsigned kSign = 0x80008000u;
-  constexpr unsigned kEM = 0x3f803f80u;    // F16 exponent field + top mantissa
-  constexpr unsigned kBias = 0x20002000u;  // exponent bias fix-up
-  unsigned p[4];
-  p[0] = __byte_perm(q.x, q.y, 0x0400);
-  p[1] = __byte_perm(q.x, q.y, 0x0501);
-  p[2] = __byte_perm(q.x, q.y, 0x0602);
-  p[3] = __byte_perm(q.x, q.y, 0x0703);
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    out[i] = ((p[i] << 8) & kSign) | ((((p[i] << 7) & kEM) + kBias) & ~kSign);
-  }
-}
-
-__device__ __forceinline__ float2 fp8_half2_to_float2(uint32_t v) {
-  return __half22float2(*reinterpret_cast<const __half2 *>(&v));
-}
-
-// ---------------------------------------------------------------------------
-// SM70 batched-decode GEMV: 1Cat's fp8_qpn8_sm70_kernel (RowTiles=2) copied
-// verbatim, with two adaptations: the channel-wise scale is F32 (this
-// checkpoint's layout) instead of F16, and grid.y splits M into 16-row blocks.
-// The decoder is the existing bit-identical `fp8_e4m3x8_to_half2x4` (its
-// kBias fold replaces 1Cat's "256 folded into the scale" convention).
-// ---------------------------------------------------------------------------
-#define SM70_QPN8_MMA_8N8K4(C, A0, A1, B0, B1)                           \
-  asm volatile(                                                          \
-      "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "                 \
-      "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "                   \
-      "{%0,%1,%2,%3,%4,%5,%6,%7};\n"                                      \
-      : "+f"(C[0]), "+f"(C[1]), "+f"(C[2]), "+f"(C[3]),                    \
-        "+f"(C[4]), "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                    \
-      : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
-
-__device__ __forceinline__ int qpn8_col_from_lane(int lane) {
-  return ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
-}
-
-template <int SplitK, int NAcc, int RowTiles>
-__global__ void fp8_qpn8_sm70_kernel(const uint8_t *__restrict__ codes,
-                                     const float *__restrict__ scales,
-                                     const half *__restrict__ input,
-                                     half *__restrict__ output, int n, int k,
-                                     int m) {
-  __shared__ float partials[SplitK][RowTiles * 256];
-  const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  const int tile = blockIdx.x;
-  const int row0 = blockIdx.y * (RowTiles * 8);
-  const int quadpair = (lane >> 2) & 3;
-  const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
-  const int groups_k16 = k >> 4;
-  const int groups_per_warp = groups_k16 / SplitK;
-  const int group_begin = warp * groups_per_warp;
-  const uint4 *code_ptr = reinterpret_cast<const uint4 *>(codes) +
-                         (size_t)tile * groups_k16 * 32 + lane;
-  const float loaded_scale =
-      __ldg(scales + tile * 32 + qpn8_col_from_lane(lane));
-
-  float accum[RowTiles][NAcc][8];
-#pragma unroll
-  for (int rt = 0; rt < RowTiles; ++rt)
-    for (int c = 0; c < NAcc; ++c)
-      for (int i = 0; i < 8; ++i) accum[rt][c][i] = 0.0f;
-
-#pragma unroll 4
-  for (int group = group_begin; group < group_begin + groups_per_warp;
-       ++group) {
-    const uint4 packed = __ldcs(code_ptr + (size_t)group * 32);
-    half2 weights[8];
-    fp8_e4m3x8_to_half2x4(make_uint2(packed.x, packed.y),
-                          reinterpret_cast<uint32_t *>(weights));
-    fp8_e4m3x8_to_half2x4(make_uint2(packed.z, packed.w),
-                          reinterpret_cast<uint32_t *>(weights) + 4);
-    const half hs = __float2half_rn(loaded_scale);
-        const half2 scale2 = __halves2half2(hs, hs);
-#pragma unroll
-    for (int i = 0; i < 8; ++i) weights[i] = __hmul2(weights[i], scale2);
-    const unsigned *b = reinterpret_cast<const unsigned *>(weights);
-#pragma unroll
-    for (int rt = 0; rt < RowTiles; ++rt) {
-      uint4 input01 = make_uint4(0, 0, 0, 0);
-      uint4 input23 = make_uint4(0, 0, 0, 0);
-      const int input_row_idx = row0 + rt * 8 + row;
-      if (input_row_idx < m) {
-        const half *ir = input + (size_t)input_row_idx * k;
-        input01 = *reinterpret_cast<const uint4 *>(ir + group * 16);
-        input23 = *reinterpret_cast<const uint4 *>(ir + group * 16 + 8);
-      }
-      const unsigned *a0 = reinterpret_cast<const unsigned *>(&input01);
-      const unsigned *a1 = reinterpret_cast<const unsigned *>(&input23);
-      SM70_QPN8_MMA_8N8K4(accum[rt][0], a0[0], a0[1], b[0], b[1]);
-      SM70_QPN8_MMA_8N8K4(accum[rt][1 % NAcc], a0[2], a0[3], b[2], b[3]);
-      SM70_QPN8_MMA_8N8K4(accum[rt][2 % NAcc], a1[0], a1[1], b[4], b[5]);
-      SM70_QPN8_MMA_8N8K4(accum[rt][3 % NAcc], a1[2], a1[3], b[6], b[7]);
-    }
-  }
-
-#pragma unroll
-  for (int rt = 0; rt < RowTiles; ++rt)
-    for (int c = 1; c < NAcc; ++c)
-      for (int i = 0; i < 8; ++i) accum[rt][0][i] += accum[rt][c][i];
-
-#pragma unroll
-  for (int rt = 0; rt < RowTiles; ++rt)
-    for (int i = 0; i < 8; ++i) {
-      const int output_row = rt * 8 + (i & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
-      const int output_col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
-      partials[warp][output_row * 32 + quadpair * 8 + output_col] =
-          accum[rt][0][i];
-    }
-  __syncthreads();
-
-  for (int element = threadIdx.x; element < RowTiles * 256;
-       element += blockDim.x) {
-    float value = 0.0f;
-#pragma unroll
-    for (int kw = 0; kw < SplitK; ++kw) value += partials[kw][element];
-    const int output_row = element >> 5;
-    const int output_col = element & 31;
-    if (row0 + output_row < m) {
-      output[(size_t)(row0 + output_row) * n + tile * 32 + output_col] =
-          __float2half(value);
-    }
-  }
-}
-
 // first converts each dequantized weight to T in shared memory.  That is a
 // precision loss for this format (especially when T is BF16), and it is
 // needlessly repeated for every K tile.  Keep this path on the FP32
@@ -537,18 +384,14 @@ template <typename T>
 static void fp8_matmul_channelwise_impl(
     const T *input, const uint8_t *weight, const float *weight_scale,
     T *output, int M, int N, int K, cudaStream_t stream) {
-  // SM70 (1Cat QPN8 semantics): the copied RowTiles=2 kernel decodes each
-  // FP8 weight byte once with the branch-free bit trick and reuses it for
-  // 16 activation rows, so batched decode (2 <= M < 256) streams weights at
-  // the same rate as M == 1. M >= 256 keeps the dequant->cublas route
-  // (fp8_linear.rs).
+  // SM70 (1Cat QPN8 semantics): the multi-row GEMV decodes each FP8 weight
+  // byte once with the branch-free bit trick and reuses it for up to 8
+  // activation rows, so batched decode (2 <= M < 256) streams weights at the
+  // same rate as M == 1. M >= 256 keeps the dequant->cublas route (fp8_linear.rs).
   if constexpr (std::is_same_v<T, __half>) {
-    if (N % 32 == 0 && K % 128 == 0) {
-      fp8_qpn8_sm70_kernel<8, 4, 2><<<dim3(N / 32, CEILDIV(M, 16)), 32 * 8, 0,
-                                     stream>>>(weight, weight_scale, input,
-                                               output, N, K, M);
-      return;
-    }
+    fp8_gemv_sm70_m_kernel<<<dim3(N, CEILDIV(M, 8)), 32, 0, stream>>>(
+        input, weight, weight_scale, output, N, K, M);
+    return;
   }
   constexpr int BM = 8;
   constexpr int BN = 64;
@@ -599,6 +442,50 @@ extern "C" void fp8_dequant_channelwise_f16(const uint8_t *w, const float *scale
   long long total = numel8;
   int grid = (int)min((long long)1024, (total + block - 1) / block);
   fp8_dequant_channelwise_f16_kernel<<<grid, block, 0, stream>>>(w, scale, out, numel8, k_over_8);
+}
+
+// ---------------------------------------------------------------------------
+// SM70 decode GEMV for channel-wise FP8 (M == 1).
+//
+// The generic `fp8_matmul_kernel` dequantizes every single weight into FP32
+// shared memory using the branchy software FP8->FP32 conversion, which costs
+// roughly 25 instructions per weight and leaves the memory system idle: on a
+// V100 it sustains 86-96 GB/s while a plain read of the same bytes reaches
+// 818 GB/s.
+//
+// This kernel uses the layout 1Cat's dense SM70 kernels use:
+//   * one warp owns one output column and the 32 lanes split K in stripes
+//     (lane l takes k-block l, l+32, ...), so the weight and activation loads
+//     are fully coalesced and no shared-memory staging is needed;
+//   * the weights are decoded straight from global memory into registers with
+//     a branch-free bit trick;
+//   * the products are accumulated in FP32, which is exact for F16 x F16.
+//
+// The result is bit-identical to `fp8_matmul_kernel` for channel-wise scales
+// (verified against a double-precision CPU reference on the 27B shapes).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void fp8_e4m3x8_to_half2x4(uint2 q, uint32_t out[4]) {
+  // E4M3 (OCP) -> F16.  The plain trick `((code & 0x7f) << 7)` yields the
+  // value scaled by 2^-8 (1Cat compensates by folding 256 into the block
+  // scale); adding 0x2000 restores the exponent bias so that the F16
+  // exponent field ends up as (E4M3 exponent + 8).  The addition cannot carry
+  // past bit 14 because that bit is zero before it.
+  constexpr unsigned kSign = 0x80008000u;
+  constexpr unsigned kEM = 0x3f803f80u;    // F16 exponent field + top mantissa
+  constexpr unsigned kBias = 0x20002000u;  // exponent bias fix-up
+  unsigned p[4];
+  p[0] = __byte_perm(q.x, q.y, 0x0400);
+  p[1] = __byte_perm(q.x, q.y, 0x0501);
+  p[2] = __byte_perm(q.x, q.y, 0x0602);
+  p[3] = __byte_perm(q.x, q.y, 0x0703);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    out[i] = ((p[i] << 8) & kSign) | ((((p[i] << 7) & kEM) + kBias) & ~kSign);
+  }
+}
+
+__device__ __forceinline__ float2 fp8_half2_to_float2(uint32_t v) {
+  return __half22float2(*reinterpret_cast<const __half2 *>(&v));
 }
 
 __global__ void fp8_gemv_sm70_kernel(const __half *__restrict__ input,
