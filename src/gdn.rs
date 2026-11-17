@@ -2615,6 +2615,18 @@ pub fn gdn_verify_mtp(
     .to_dtype(DType::I64)?
     .contiguous()?;
     let o = Tensor::zeros((total_tokens, num_v_heads, kd), qkv.dtype(), qkv.device())?;
+            // D17: run the kernel's replay route. rbuf holds two sides x nmax
+            // sequences of the round's normalized k, raw v and (decay, beta);
+            // with rmap null the shared round counter ctr picks the side, slot = n.
+            let per_seq = tmax * num_k_heads * kd + tmax * num_v_heads * kd
+                + tmax * num_v_heads * 2;
+            let rbuf = Tensor::zeros((2 * n * per_seq, 1, 1, 1), DType::F32, qkv.device())?;
+            let ctr = Tensor::zeros((2, 1, 1, 1), DType::U32, qkv.device())?;
+            // rn is the per-sequence count of tokens to replay, not the cumsum.
+            let rn_i64 = cu_i32.to_vec1::<i64>().ok().map(|v| {
+                v[1..].iter().zip(v[..v.len() - 1].iter())
+                    .map(|(&hi, &lo)| (hi - lo) as i64).collect::<Vec<_>>()
+            });
     let stream = *dev.cu_stream() as i64;
     unsafe {
         ffi::gdn_verify_sm70(
@@ -2641,11 +2653,11 @@ pub fn gdn_verify_mtp(
             qkv_stride as c_int,
             a.dim(1)? as c_int,
             b.dim(1)? as c_int,
-            std::ptr::null(), // rbuf: non-replay route
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null(),
+            get_cuda_mut_ptr(&rbuf)?,          // two sides x nmax sequences
+            rn_i64.as_ref().map(|v| v.as_ptr()).unwrap_or_default(),
+            get_cuda_mut_ptr(&ctr)? as *mut u32,
+            n as i64,                        // nmax
+            std::ptr::null(),               // rmap: ctr picks the side, slot = n
             std::ptr::null(),
             std::ptr::null(),
             tmax as c_int,
