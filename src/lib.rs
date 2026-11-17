@@ -309,13 +309,18 @@ impl InputMetadata {
     /// `cu_seqlens_q` is that cumsum, so the token axis is read off it instead
     /// of being re-derived from the sequence count at every call site.
     pub fn num_accepted_tokens(&self) -> Option<Tensor> {
+    /// The count each sequence KEEPS this step. `seqlens` carries it when the
+    /// caller knows it (the accepted count of the step that produced the state we
+    /// are about to resume from); `diff(cu_seqlens_q)` spans the tokens being
+    /// verified, which is the proposed count, not the kept one.
+    if let Some(lens) = &self.seqlens {
+        let q = self.cu_seqlens_q.as_ref()?;
+        return Tensor::from_vec(lens.clone(), (lens.len(),), q.device()).ok();
+    }
+
         let q = self.cu_seqlens_q.as_ref()?;
         let starts = q.to_vec1::<u32>().ok()?;
-        let lens = starts[1..]
-            .iter()
-            .zip(starts[..starts.len() - 1].iter())
-            .map(|(&hi, &lo)| hi - lo)
-            .collect::<Vec<_>>();
+        let lens = starts[1..].iter().zip(starts[..starts.len() - 1].iter()).map(|(&hi, &lo)| hi - lo).collect::<Vec<_>>();
         let n = lens.len();
         Tensor::from_vec(lens, (n,), q.device()).ok()
     }
