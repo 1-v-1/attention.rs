@@ -2585,6 +2585,7 @@ pub fn gdn_verify_mtp(
     src_slots: &Tensor,
     state_snapshots: &Tensor,
     cu_seqlens: &Tensor,
+    nacc: Option<&Tensor>,
     scale: f32,
 ) -> Result<Tensor> {
     let Device::Cuda(dev) = qkv.device() else {
@@ -2617,6 +2618,7 @@ pub fn gdn_verify_mtp(
     let o = Tensor::zeros((total_tokens, num_v_heads, kd), qkv.dtype(), qkv.device())?;
     let stream = *dev.cu_stream() as i64;
     unsafe {
+            let nacc_i64 = nacc.map(|t| t.to_dtype(DType::I64).and_then(|t| t.contiguous())).transpose()?.map(|t| t.to_vec1::<i64>()).transpose()?;
         ffi::gdn_verify_sm70(
             get_cuda_const_ptr(qkv)?,
             get_cuda_const_ptr(a)?,
@@ -2627,7 +2629,7 @@ pub fn gdn_verify_mtp(
             get_cuda_mut_ptr(&o)?,
             get_cuda_const_ptr_i64(&cu_i32)?,
             get_cuda_const_ptr_i64(&idx_i32)?,
-            std::ptr::null(), // nacc: initial state comes from src_slots directly
+            nacc_i64.as_ref().map(|v| v.as_ptr()).unwrap_or_default(),
             n as c_int,
             num_k_heads as c_int,
             num_v_heads as c_int,
