@@ -2619,6 +2619,7 @@ pub fn gdn_verify_mtp(
     let stream = *dev.cu_stream() as i64;
     unsafe {
             let nacc_i64 = nacc.map(|t| t.to_dtype(DType::I64).and_then(|t| t.contiguous())).transpose()?.map(|t| t.to_vec1::<i64>()).transpose()?;
+            let s_idx = (total_tokens / n) as c_int;
         ffi::gdn_verify_sm70(
             get_cuda_const_ptr(qkv)?,
             get_cuda_const_ptr(a)?,
@@ -2636,7 +2637,7 @@ pub fn gdn_verify_mtp(
             scale,
             1, // cfg
             (num_v_heads * kd * kd) as i64, // s_state
-            1,                              // s_idx
+            s_idx,                          // row stride of the 2-D state index
             qkv_stride as c_int,
             a.dim(1)? as c_int,
             b.dim(1)? as c_int,
