@@ -2636,7 +2636,10 @@ pub fn gdn_verify_mtp(
             num_v_heads as c_int,
             scale,
             1, // cfg
-            (num_v_heads * kd * kd) as i64, // s_state
+            // s_state: the row stride is the product of the snapshot's trailing
+            // dims, which are (num_v_heads, head_k_dim, head_v_dim). Using kd*kd
+            // silently mis-strides whenever head_v_dim != head_k_dim.
+            (state_snapshots.dim(1)? * state_snapshots.dim(2)? * state_snapshots.dim(3)?) as i64,
             s_idx,                          // row stride of the 2-D state index
             qkv_stride as c_int,
             a.dim(1)? as c_int,
